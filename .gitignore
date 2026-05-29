@@ -1,0 +1,10 @@
+debug
+target
+**/*.rs.bk
+**/mutants.out*/
+.env
+*.sqlite
+*.md
+!README.md
+!CHANGELOG.md
+specs/

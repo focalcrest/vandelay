@@ -1,0 +1,6 @@
+BEGIN:VCARD
+VERSION:2.1
+UID:urn:uuid:37ca3098-8a4a-5bc3-8069-e2d958d71dbb
+EMAIL;PREF:john.doe@company.com
+CATEGORIES:My Contacts
+END:VCARD
