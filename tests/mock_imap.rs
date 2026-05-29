@@ -511,6 +511,43 @@ fn control_script_one_folder(uidvalidity: u32, uidnext: u32, uids: &'static [u32
     })
 }
 
+fn control_script_present_flags(
+    uidvalidity: u32,
+    uidnext: u32,
+    uids: &'static [u32],
+    flags_reply: &'static [(u32, &'static str)],
+) -> Script {
+    Box::new(move |conn: &mut MockConn| -> std::io::Result<()> {
+        auth_preamble(conn, "IMAP4rev2 LITERAL+ AUTH=PLAIN")?;
+        let (tag, cmd) = conn.read_command()?;
+        assert_eq!(cmd, "LIST \"\" \"*\"");
+        conn.write_line("* LIST () \"/\" \"INBOX\"")?;
+        conn.write_line(&format!("{tag} OK LIST done"))?;
+        let (tag, cmd) = conn.read_command()?;
+        assert_eq!(cmd, "LSUB \"\" \"*\"");
+        conn.write_line(&format!("{tag} OK LSUB done"))?;
+        let (tag, cmd) = conn.read_command()?;
+        assert_eq!(cmd, "SELECT \"INBOX\"");
+        write_select(conn, &tag, uidvalidity, uidnext, uids.len() as u32)?;
+        let (tag, cmd) = conn.read_command()?;
+        assert_eq!(cmd, "UID SEARCH ALL");
+        let uid_strs: Vec<String> = uids.iter().map(|u| u.to_string()).collect();
+        conn.write_line(&format!("* SEARCH {}", uid_strs.join(" ")))?;
+        conn.write_line(&format!("{tag} OK SEARCH done"))?;
+        let (tag, cmd) = conn.read_command()?;
+        assert!(
+            cmd.starts_with("UID FETCH") && cmd.contains("(UID FLAGS)") && !cmd.contains("BODY"),
+            "expected body-less flags fetch on the present set, got {cmd}"
+        );
+        for (uid, flags) in flags_reply {
+            conn.write_line(&format!("* {uid} FETCH (UID {uid} FLAGS ({flags}))"))?;
+        }
+        conn.write_line(&format!("{tag} OK FETCH done"))?;
+        drain_until_close(conn);
+        Ok(())
+    })
+}
+
 #[test]
 fn coordinator_imports_one_folder_one_message() {
     let server = MockImap::start_scripts(vec![
@@ -755,7 +792,7 @@ fn coordinator_present_run_is_convergent() {
     let mut scripts: Vec<Script> = Vec::new();
     scripts.extend(single_inbox_scripts(100, 2, MSG_BODY));
 
-    scripts.push(control_script_one_folder(100, 2, &[1]));
+    scripts.push(control_script_present_flags(100, 2, &[1], &[(1, "\\Seen")]));
     scripts.push(worker_idle_script("IMAP4rev2 LITERAL+ AUTH=PLAIN"));
     let server = MockImap::start_scripts(scripts);
     let archive = tempfile("converge");
@@ -768,6 +805,78 @@ fn coordinator_present_run_is_convergent() {
         .unwrap();
     assert_eq!(email.1.created, 0, "convergent run creates nothing");
     assert_eq!(email.1.deleted, 0, "convergent run deletes nothing");
+    assert_eq!(email.1.updated, 0, "unchanged flags update nothing");
+    let dbc = Connection::open(&archive).unwrap();
+    assert_eq!(count(&dbc, "blobs"), 1, "no body re-fetched on a present-only run");
+}
+
+#[test]
+fn coordinator_present_flag_change_updates_keywords() {
+    let mut scripts: Vec<Script> = Vec::new();
+    scripts.extend(single_inbox_scripts(100, 2, MSG_BODY));
+    scripts.push(control_script_present_flags(
+        100,
+        2,
+        &[1],
+        &[(1, "\\Seen \\Flagged")],
+    ));
+    scripts.push(worker_idle_script("IMAP4rev2 LITERAL+ AUTH=PLAIN"));
+    let server = MockImap::start_scripts(scripts);
+    let archive = tempfile("flagupdate");
+    run_import(&server, "alice", archive.clone(), |_| {}).expect("first import");
+    let summary = run_import(&server, "alice", archive.clone(), |_| {}).expect("second import");
+    let email = summary
+        .per_type
+        .iter()
+        .find(|(k, _)| *k == "email")
+        .unwrap();
+    assert_eq!(email.1.updated, 1, "a changed flag set is counted as updated");
+    assert_eq!(email.1.created, 0, "present message is not re-created");
+    assert_eq!(email.1.fetched, 0, "no body fetched on a present-only run");
+    let dbc = Connection::open(&archive).unwrap();
+    assert_eq!(count(&dbc, "blobs"), 1, "body not re-fetched");
+    let kw: String = dbc
+        .query_row("SELECT keywords FROM emails LIMIT 1", [], |r| r.get(0))
+        .unwrap();
+    assert!(
+        kw.contains("$seen") && kw.contains("$flagged"),
+        "keywords should reflect the new \\Flagged: {kw}"
+    );
+}
+
+#[test]
+fn coordinator_present_newly_deleted_is_left_intact() {
+    let mut scripts: Vec<Script> = Vec::new();
+    scripts.extend(single_inbox_scripts(100, 2, MSG_BODY));
+    scripts.push(control_script_present_flags(
+        100,
+        2,
+        &[1],
+        &[(1, "\\Seen \\Deleted")],
+    ));
+    scripts.push(worker_idle_script("IMAP4rev2 LITERAL+ AUTH=PLAIN"));
+    let server = MockImap::start_scripts(scripts);
+    let archive = tempfile("presentdeleted");
+    run_import(&server, "alice", archive.clone(), |_| {}).expect("first import");
+    let summary = run_import(&server, "alice", archive.clone(), |_| {}).expect("second import");
+    let email = summary
+        .per_type
+        .iter()
+        .find(|(k, _)| *k == "email")
+        .unwrap();
+    assert_eq!(
+        email.1.updated, 0,
+        "a present message that newly gained \\Deleted is skipped, not updated"
+    );
+    let dbc = Connection::open(&archive).unwrap();
+    assert_eq!(count(&dbc, "emails"), 1, "the archived message is preserved");
+    let kw: String = dbc
+        .query_row("SELECT keywords FROM emails LIMIT 1", [], |r| r.get(0))
+        .unwrap();
+    assert!(
+        kw.contains("$seen") && !kw.contains("$deleted"),
+        "keywords left intact: {kw}"
+    );
 }
 
 #[test]

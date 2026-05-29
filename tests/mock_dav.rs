@@ -67,6 +67,66 @@ fn discovery_uses_url_as_homeset_when_collection_present() {
 }
 
 #[test]
+fn discovery_resolves_per_user_principal_even_when_url_lists_collections() {
+    let mut server = mockito::Server::new();
+    let url = server.url();
+
+    let collections_body = format!(
+        r#"<?xml version="1.0"?>
+<d:multistatus xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">
+  <d:response>
+    <d:href>{url}/dav/cal/secondary@vandelay.org/default/</d:href>
+    <d:propstat>
+      <d:prop>
+        <d:resourcetype><d:collection/><c:calendar/></d:resourcetype>
+        <d:displayname>Default</d:displayname>
+      </d:prop>
+      <d:status>HTTP/1.1 200 OK</d:status>
+    </d:propstat>
+  </d:response>
+</d:multistatus>"#
+    );
+    let _listing = server
+        .mock("PROPFIND", "/dav/cal/")
+        .match_header("depth", "1")
+        .with_status(207)
+        .with_header("content-type", "application/xml; charset=utf-8")
+        .with_body(&collections_body)
+        .create();
+
+    let principal_body = format!(
+        r#"<?xml version="1.0"?>
+<d:multistatus xmlns:d="DAV:">
+  <d:response>
+    <d:href>{url}/dav/cal/</d:href>
+    <d:propstat>
+      <d:prop>
+        <d:current-user-principal><d:href>{url}/dav/principals/secondary@vandelay.org/</d:href></d:current-user-principal>
+      </d:prop>
+      <d:status>HTTP/1.1 200 OK</d:status>
+    </d:propstat>
+  </d:response>
+</d:multistatus>"#
+    );
+    let _principal = server
+        .mock("PROPFIND", "/dav/cal/")
+        .match_header("depth", "0")
+        .with_status(207)
+        .with_header("content-type", "application/xml; charset=utf-8")
+        .with_body(&principal_body)
+        .create();
+
+    let c = client(0);
+    let disc = discover(&c, DavKind::Caldav, &format!("{url}/dav/cal/")).expect("discover");
+    assert_eq!(disc.collections.len(), 1);
+    assert_eq!(
+        disc.principal_url.as_deref(),
+        Some(format!("{url}/dav/principals/secondary@vandelay.org/").as_str()),
+        "account identity must be the per-user principal, not the shared base DAV root"
+    );
+}
+
+#[test]
 fn discovery_falls_through_principal_to_home_set() {
     let mut server = mockito::Server::new();
     let url = server.url();
@@ -1127,6 +1187,133 @@ fn dry_run_writes_nothing_but_emits_per_collection_counts() {
         .expect("event counts in summary");
     assert_eq!(calendar_counts.1.created, 1);
     assert_eq!(event_counts.1.created, 2);
+}
+
+#[test]
+fn dav_source_change_protection_fires_across_users_on_same_root() {
+    use base64::Engine;
+    use base64::engine::general_purpose::STANDARD;
+    use std::path::PathBuf;
+    use vandelay::logging::Logger;
+    use vandelay::sync::CommonConfig;
+    use vandelay::sync::import_dav::{DavAuth, DavImportConfig, DavKindArg, run};
+
+    let mut server = mockito::Server::new();
+    let url = server.url();
+
+    let listing = format!(
+        r#"<?xml version="1.0"?>
+<d:multistatus xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">
+  <d:response>
+    <d:href>{url}/dav/cal/shared/default/</d:href>
+    <d:propstat>
+      <d:prop>
+        <d:resourcetype><d:collection/><c:calendar/></d:resourcetype>
+        <d:displayname>Default</d:displayname>
+      </d:prop>
+      <d:status>HTTP/1.1 200 OK</d:status>
+    </d:propstat>
+  </d:response>
+</d:multistatus>"#
+    );
+    let _listing = server
+        .mock("PROPFIND", "/dav/cal/")
+        .match_header("depth", "1")
+        .with_status(207)
+        .with_header("content-type", "application/xml; charset=utf-8")
+        .with_body(&listing)
+        .create();
+
+    let empty_items = format!(
+        r#"<?xml version="1.0"?>
+<d:multistatus xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">
+  <d:response>
+    <d:href>{url}/dav/cal/shared/default/</d:href>
+    <d:propstat>
+      <d:prop><d:resourcetype><d:collection/><c:calendar/></d:resourcetype></d:prop>
+      <d:status>HTTP/1.1 200 OK</d:status>
+    </d:propstat>
+  </d:response>
+</d:multistatus>"#
+    );
+    let _items = server
+        .mock("PROPFIND", "/dav/cal/shared/default/")
+        .with_status(207)
+        .with_header("content-type", "application/xml; charset=utf-8")
+        .with_body(&empty_items)
+        .create();
+
+    let auth_a = format!("Basic {}", STANDARD.encode("secondary@vandelay.org:passA"));
+    let auth_b = format!("Basic {}", STANDARD.encode("tertiary@vandelay.org:passB"));
+    let principal = |who: &str| {
+        format!(
+            r#"<?xml version="1.0"?>
+<d:multistatus xmlns:d="DAV:">
+  <d:response>
+    <d:href>{url}/dav/cal/</d:href>
+    <d:propstat>
+      <d:prop><d:current-user-principal><d:href>{url}/dav/principals/{who}/</d:href></d:current-user-principal></d:prop>
+      <d:status>HTTP/1.1 200 OK</d:status>
+    </d:propstat>
+  </d:response>
+</d:multistatus>"#
+        )
+    };
+    let _pa = server
+        .mock("PROPFIND", "/dav/cal/")
+        .match_header("depth", "0")
+        .match_header("authorization", auth_a.as_str())
+        .with_status(207)
+        .with_header("content-type", "application/xml; charset=utf-8")
+        .with_body(principal("secondary@vandelay.org"))
+        .create();
+    let _pb = server
+        .mock("PROPFIND", "/dav/cal/")
+        .match_header("depth", "0")
+        .match_header("authorization", auth_b.as_str())
+        .with_status(207)
+        .with_header("content-type", "application/xml; charset=utf-8")
+        .with_body(principal("tertiary@vandelay.org"))
+        .create();
+
+    let archive: PathBuf = std::env::temp_dir().join(format!(
+        "vandelay-dav-srcchange-{}-{}.sqlite",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let _ = std::fs::remove_file(&archive);
+
+    let common = |archive: &PathBuf| CommonConfig {
+        archive: archive.clone(),
+        threads: 1,
+        dry_run: false,
+        max_retries: 0,
+        allow_invalid_certs: true,
+        logger: Logger::from_flags(false, 0),
+    };
+    let config = |user: &str, pass: &str| DavImportConfig {
+        kind: DavKindArg::Caldav,
+        url: format!("{url}/dav/cal/"),
+        auth: DavAuth::Basic {
+            user: user.to_owned(),
+            password: pass.to_owned(),
+        },
+        allow_cleartext: true,
+        dav_connections: 1,
+        multiget_batch: 50,
+        allow_source_change: false,
+    };
+
+    run(common(&archive), config("secondary@vandelay.org", "passA")).expect("user A import ok");
+    let err = run(common(&archive), config("tertiary@vandelay.org", "passB")).unwrap_err();
+    let _ = std::fs::remove_file(&archive);
+    assert!(
+        matches!(err, vandelay::error::Error::SourceChange(_)),
+        "importing a different user into the same archive must trigger source-change protection; got {err:?}"
+    );
 }
 
 #[test]

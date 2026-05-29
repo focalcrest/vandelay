@@ -826,6 +826,18 @@ fn reconcile_folder(
         tx.commit()?;
     }
 
+    if !diff.present.is_empty() {
+        counts.updated += refresh_present_flags(
+            conn,
+            client,
+            control_ctx,
+            &folder.name,
+            uidvalidity,
+            &diff.present,
+            opts,
+        )?;
+    }
+
     let now = OffsetDateTime::now_utc()
         .format(&Rfc3339)
         .unwrap_or_else(|_| String::from("1970-01-01T00:00:00Z"));
@@ -959,6 +971,93 @@ fn insert_single_message(
     counts.created += 1;
     counts.fetched += 1;
     Ok(())
+}
+
+fn refresh_present_flags(
+    conn: &mut Connection,
+    client: &mut ImapClient,
+    control_ctx: &ControlCtx,
+    folder: &str,
+    uidvalidity: u32,
+    present: &[u32],
+    opts: RunOpts,
+) -> Result<u64, Error> {
+    let RunOpts {
+        source_id,
+        fetch_batch,
+        include_deleted,
+        logger: _,
+    } = opts;
+    let mut updated: u64 = 0;
+    let tx = conn.transaction()?;
+    for batch in chunks(present, fetch_batch.max(1)) {
+        let set = command::format_uid_set(batch, true);
+        let resp = control_run_collect(
+            client,
+            control_ctx,
+            &command::uid_fetch(&set, &["UID", "FLAGS"]),
+        )?;
+        for u in &resp.untagged {
+            let Some(attrs) = fetch::extract(u) else {
+                continue;
+            };
+            let Some(uid) = attrs.uid else {
+                continue;
+            };
+            let translation = translate_flags(&attrs.flags, include_deleted);
+            if translation.has_deleted_flag && !include_deleted {
+                continue;
+            }
+            let Some((local_id, existing)) =
+                load_email_keywords(&tx, source_id, folder, uidvalidity, uid)?
+            else {
+                continue;
+            };
+            if keyword_set_differs(&existing, &translation.keywords) {
+                let json = Value::Array(
+                    translation
+                        .keywords
+                        .iter()
+                        .cloned()
+                        .map(Value::String)
+                        .collect(),
+                );
+                tx.execute(
+                    "UPDATE emails SET keywords = ?1 WHERE id = ?2",
+                    params![json.to_string(), local_id],
+                )?;
+                updated += 1;
+            }
+        }
+    }
+    tx.commit()?;
+    Ok(updated)
+}
+
+fn load_email_keywords(
+    tx: &rusqlite::Transaction<'_>,
+    source_id: i64,
+    folder: &str,
+    uidvalidity: u32,
+    uid: u32,
+) -> Result<Option<(i64, Vec<String>)>, Error> {
+    let Some(local_id) = db::imap_ids::local_for_email(tx, source_id, folder, uidvalidity, uid)?
+    else {
+        return Ok(None);
+    };
+    let kw_json: String = tx.query_row(
+        "SELECT keywords FROM emails WHERE id = ?1",
+        params![local_id],
+        |r| r.get(0),
+    )?;
+    let kws: Vec<String> = serde_json::from_str(&kw_json).unwrap_or_default();
+    Ok(Some((local_id, kws)))
+}
+
+fn keyword_set_differs(a: &[String], b: &[String]) -> bool {
+    let sa: HashSet<&str> = a.iter().map(String::as_str).collect();
+    let sb: HashSet<&str> = b.iter().map(String::as_str).collect();
+    sa != sb
 }
 
 fn dry_run_summary(

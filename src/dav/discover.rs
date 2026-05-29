@@ -136,11 +136,41 @@ fn try_treat_url_as_home_or_collection(
     if collections.is_empty() {
         return Ok(None);
     }
+    let principal_url = resolve_principal_url(client, kind, url)?;
     Ok(Some(Discovery {
-        principal_url: None,
+        principal_url,
         home_set_url: url.to_owned(),
         collections,
     }))
+}
+
+fn resolve_principal_url(
+    client: &DavClient,
+    kind: DavKind,
+    url: &str,
+) -> Result<Option<String>, DiscoveryError> {
+    if matches!(kind, DavKind::Webdav) {
+        return Ok(None);
+    }
+    let body = xml::propfind_current_user_principal();
+    let ms = match client.propfind_responses(url, 0, &body, url) {
+        Ok(ms) => ms,
+        Err(JmapError::HttpStatus { status, .. }) if (400..600).contains(&status) => {
+            return Ok(None);
+        }
+        Err(JmapError::RetriesExhausted(_)) => return Ok(None),
+        Err(e) => return Err(DiscoveryError::Transport(e)),
+    };
+    let final_url = ms.final_url.clone();
+    let Some(principal_href) = ms
+        .responses
+        .iter()
+        .find_map(|r| r.props.current_user_principal.as_deref())
+    else {
+        return Ok(None);
+    };
+    let resolved = absolute_url(&final_url, &normalise(&final_url, principal_href)?)?;
+    Ok(Some(resolved))
 }
 
 fn try_via_principal(

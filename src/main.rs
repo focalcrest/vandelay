@@ -98,8 +98,8 @@ fn fail(err: &Error) -> i32 {
 fn report(summary: &Summary) {
     for (type_name, counts) in &summary.per_type {
         println!(
-            "{type_name}: created={} fetched={} deleted={} skipped={} failed={}",
-            counts.created, counts.fetched, counts.deleted, counts.skipped, counts.failed
+            "{type_name}: created={} fetched={} updated={} deleted={} skipped={} failed={}",
+            counts.created, counts.fetched, counts.updated, counts.deleted, counts.skipped, counts.failed
         );
     }
 }

@@ -57,6 +57,56 @@ Because the archive is a self-contained SQLite file that fully describes one acc
 - **Source-change protection:** An archive remembers which account it was filled from; pointing it at a different one fails unless explicitly permitted.
 - **Read-only inspection:** A built-in `inspect` command dumps any object type from an archive for verification.
 
+## Install
+
+```sh
+# macOS / Linux
+curl --proto '=https' --tlsv1.2 -LsSf \
+  https://github.com/stalwartlabs/vandelay/releases/latest/download/vandelay-installer.sh | sh
+
+# Homebrew
+brew install stalwartlabs/tap/vandelay
+
+# Windows
+powershell -ExecutionPolicy Bypass -c "irm https://github.com/stalwartlabs/vandelay/releases/latest/download/vandelay-installer.ps1 | iex"
+
+# npm
+npm install -g @stalwartlabs/vandelay
+
+# From source
+cargo install --path .
+```
+
+A signed `.msi` is also published with each release.
+
+## Quick start
+
+A typical run is two commands, one to capture a source account into a local SQLite archive and one to push that archive into a JMAP target.
+
+```sh
+# 1. Import an IMAP mailbox into a fresh archive.
+export VANDELAY_PASSWORD='source-app-password'
+vandelay import imap \
+  --url imaps://imap.example.com \
+  --auth-basic alice@example.com \
+  alice.sqlite
+
+# 2. Peek at what landed.
+vandelay inspect alice.sqlite                 # per-type summary
+vandelay inspect alice.sqlite mailbox         # mailbox tree
+vandelay inspect alice.sqlite email --limit 5
+
+# 3. Push the archive into a target JMAP server.
+export VANDELAY_PASSWORD='target-password'
+vandelay export \
+  --url https://jmap.example.org \
+  --auth-basic alice@example.org \
+  --account-name alice@example.org \
+  alice.sqlite
+```
+
+Both commands are convergent: rerun either to resume an interrupted run, or rerun `import` later to pick up new mail since the last snapshot. Use `--dry-run` on either side to compute the full plan without writing.
+
 ## CLI quick reference
 
 ```

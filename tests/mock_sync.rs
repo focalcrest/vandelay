@@ -1098,17 +1098,17 @@ fn export_calendar_creates_only_missing() {
 }
 
 #[test]
-fn export_sieve_script_skips_matching_blob_content() {
+fn export_sieve_script_matches_by_name_not_content() {
     let mut server = mockito::Server::new();
     let base = server.url();
     let api = "/jmap/api";
     let archive = tmp();
-    let local_script = b"require [\"fileinto\"];\nkeep;\n";
-    let new_script = b"require [\"reject\"];\nreject \"go away\";\n";
+    let keepall_local = b"require [\"fileinto\"];\nkeep;\n";
+    let reject_local = b"require [\"reject\"];\nreject \"go away\";\n";
     {
         let conn = db::init::open(&archive).unwrap();
-        let blob1 = db::blobs::intern_blob(&conn, local_script).unwrap();
-        let blob2 = db::blobs::intern_blob(&conn, new_script).unwrap();
+        let blob1 = db::blobs::intern_blob(&conn, keepall_local).unwrap();
+        let blob2 = db::blobs::intern_blob(&conn, reject_local).unwrap();
         conn.execute(
             "INSERT INTO sieve_scripts (id,name,is_active,blob_id) VALUES (1,'keepall',1,?1)",
             rusqlite::params![blob1],
@@ -1132,16 +1132,16 @@ fn export_sieve_script_skips_matching_blob_content() {
         .match_body(Matcher::Regex("SieveScript/get".into()))
         .with_body(
             json!({"methodResponses":[["SieveScript/get",{"accountId":"w","list":[
-                {"id":"S1","name":"already-there","isActive":false,"blobId":"BSRV"}
+                {"id":"S1","name":"keepall","isActive":false,"blobId":"BSRV"}
             ],"notFound":[]},"g"]]})
             .to_string(),
         )
         .expect(1)
         .create();
-    let _dl = server
+    let no_download = server
         .mock("GET", Matcher::Regex("/jmap/dl/w/BSRV/.*".into()))
-        .with_body(local_script.as_slice())
-        .expect(1)
+        .with_body(b"unused".as_slice())
+        .expect(0)
         .create();
     let upload = server
         .mock("POST", Matcher::Regex("/jmap/upload/".into()))
@@ -1177,6 +1177,7 @@ fn export_sieve_script_skips_matching_blob_content() {
     .expect("export");
     upload.assert();
     create.assert();
+    no_download.assert();
     let counts = summary
         .per_type
         .iter()
@@ -1185,9 +1186,118 @@ fn export_sieve_script_skips_matching_blob_content() {
         .expect("sieve counts");
     assert_eq!(
         counts.skipped, 1,
-        "matching-blob script is skipped regardless of name"
+        "name-matched script is skipped even though its content differs from the target"
     );
-    assert_eq!(counts.created, 1, "differing-blob script is created");
+    assert_eq!(counts.created, 1, "the unmatched name is created");
+    assert_eq!(counts.failed, 0);
+    let _ = std::fs::remove_file(&archive);
+}
+
+#[test]
+fn export_sieve_scripts_identical_content_different_names_both_created() {
+    let mut server = mockito::Server::new();
+    let base = server.url();
+    let api = "/jmap/api";
+    let archive = tmp();
+    let shared = b"require [\"fileinto\"];\nfileinto \"Archive\";\n";
+    {
+        let conn = db::init::open(&archive).unwrap();
+        let blob = db::blobs::intern_blob(&conn, shared).unwrap();
+        conn.execute(
+            "INSERT INTO sieve_scripts (id,name,is_active,blob_id) VALUES (1,'duplicate-A',0,?1)",
+            rusqlite::params![blob],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO sieve_scripts (id,name,is_active,blob_id) VALUES (2,'duplicate-B',0,?1)",
+            rusqlite::params![blob],
+        )
+        .unwrap();
+        let dup_count: i64 = conn
+            .query_row(
+                "SELECT count(DISTINCT blob_id) FROM sieve_scripts",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(dup_count, 1, "both scripts share one blob (byte-identical)");
+    }
+
+    let _root = server.mock("GET", "/").with_status(404).create();
+    let _wk = server
+        .mock("GET", "/.well-known/jmap")
+        .with_body(session_body_full(&base))
+        .expect_at_least(1)
+        .create();
+    let _g = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("SieveScript/get".into()))
+        .with_body(
+            json!({"methodResponses":[["SieveScript/get",
+                {"accountId":"w","list":[],"notFound":[]},"g"]]})
+            .to_string(),
+        )
+        .expect(1)
+        .create();
+    let upload = server
+        .mock("POST", Matcher::Regex("/jmap/upload/".into()))
+        .with_body(json!({"blobId":"UPN"}).to_string())
+        .expect(1)
+        .create();
+    let create_a = server
+        .mock("POST", api)
+        .match_body(Matcher::AllOf(vec![
+            Matcher::Regex("SieveScript/set".into()),
+            Matcher::Regex("duplicate-A".into()),
+        ]))
+        .with_body(
+            json!({"methodResponses":[["SieveScript/set",{"accountId":"w",
+                "created":{"c1":{"id":"S1"}}},"s"]]})
+            .to_string(),
+        )
+        .expect(1)
+        .create();
+    let create_b = server
+        .mock("POST", api)
+        .match_body(Matcher::AllOf(vec![
+            Matcher::Regex("SieveScript/set".into()),
+            Matcher::Regex("duplicate-B".into()),
+        ]))
+        .with_body(
+            json!({"methodResponses":[["SieveScript/set",{"accountId":"w",
+                "created":{"c2":{"id":"S2"}}},"s"]]})
+            .to_string(),
+        )
+        .expect(1)
+        .create();
+    let _deactivate = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("onSuccessDeactivateScript".into()))
+        .with_body(
+            json!({"methodResponses":[["SieveScript/set",{"accountId":"w"},"a"]]}).to_string(),
+        )
+        .expect(1)
+        .create();
+
+    let summary = sync::export::run(
+        common(&archive),
+        export_cfg_objects(&base, vec![ObjectType::SieveScript]),
+    )
+    .expect("export");
+    upload.assert();
+    create_a.assert();
+    create_b.assert();
+    let counts = summary
+        .per_type
+        .iter()
+        .find(|(t, _)| *t == "SieveScript")
+        .map(|(_, c)| c.clone())
+        .expect("sieve counts");
+    assert_eq!(
+        counts.created, 2,
+        "two scripts with identical content but distinct names must both reach the target"
+    );
+    assert_eq!(counts.skipped, 0, "neither distinct name collapses onto the other");
     assert_eq!(counts.failed, 0);
     let _ = std::fs::remove_file(&archive);
 }

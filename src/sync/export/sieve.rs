@@ -4,19 +4,16 @@
  * SPDX-License-Identifier: Apache-2.0 OR MIT
  */
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use serde_json::{Value, json};
 
 use super::common::{create_batch, jid, target_get_all};
 use super::{Maps, Net, Plan, Uploader};
-use crate::db;
 use crate::error::Error;
-use crate::jmap::blobxfer;
 use crate::jmap::request::Request;
 use crate::logging::Logger;
 use crate::sync::import_jmap::mapping::{SIEVE_SELECT, row_to_sieve_script};
-use crate::sync::keys::blake3_bytes;
 use crate::sync::{Context, TypeCounts};
 use crate::types::ObjectType;
 
@@ -30,21 +27,12 @@ pub fn reconcile(
     let ty = ObjectType::SieveScript;
     let targets = target_get_all(net, ty).map_err(Error::from)?;
 
-    let mut target_by_key: HashMap<[u8; 32], String> = HashMap::new();
+    let mut target_by_name: HashMap<String, String> = HashMap::new();
     for t in &targets {
-        let (Some(id), Some(blob)) = (jid(t), t.get("blobId").and_then(Value::as_str)) else {
+        let (Some(id), Some(name)) = (jid(t), t.get("name").and_then(Value::as_str)) else {
             continue;
         };
-        let bytes = blobxfer::download_bytes(
-            &net.client,
-            &net.session,
-            &net.account,
-            blob,
-            "application/sieve",
-            "script",
-        )
-        .map_err(Error::from)?;
-        target_by_key.insert(blake3_bytes(&bytes), id);
+        target_by_name.insert(name.to_owned(), id);
     }
 
     let locals: Vec<(i64, Option<String>, bool, i64)> = {
@@ -71,13 +59,10 @@ pub fn reconcile(
     let mut uploader = Uploader::new(net, &ctx.conn);
 
     for (local, name, is_active, blob_local) in &locals {
-        let bytes = db::blobs::blob_bytes(&ctx.conn, *blob_local)
-            .map_err(|e| Error::Partial(e.to_string()))?
-            .ok_or_else(|| Error::Partial("sieve blob missing".to_owned()))?;
-        let key = blake3_bytes(&bytes);
-        let target_id = if let Some(id) = target_by_key.get(&key) {
+        let matched = name.as_ref().and_then(|n| target_by_name.get(n)).cloned();
+        let target_id = if let Some(id) = matched {
             counts.skipped += 1;
-            id.clone()
+            id
         } else {
             let blob_id = uploader
                 .upload_with(*blob_local, "application/sieve")
@@ -92,7 +77,9 @@ pub fn reconcile(
             match outcome.created.first().and_then(|(_, v)| jid(v)) {
                 Some(id) => {
                     counts.created += 1;
-                    target_by_key.insert(key, id.clone());
+                    if let Some(n) = name {
+                        target_by_name.insert(n.clone(), id.clone());
+                    }
                     id
                 }
                 None => {
@@ -128,18 +115,10 @@ pub fn reconcile(
         }
     }
 
-    let local_keys: std::collections::HashSet<[u8; 32]> = locals
+    let local_names: HashSet<String> = locals.iter().filter_map(|(_, n, _, _)| n.clone()).collect();
+    let mut prune_candidates: Vec<String> = target_by_name
         .iter()
-        .filter_map(|(_, _, _, b)| {
-            db::blobs::blob_bytes(&ctx.conn, *b)
-                .ok()
-                .flatten()
-                .map(|by| blake3_bytes(&by))
-        })
-        .collect();
-    let mut prune_candidates: Vec<String> = target_by_key
-        .iter()
-        .filter(|(k, _)| !local_keys.contains(*k))
+        .filter(|(name, _)| !local_names.contains(*name))
         .map(|(_, id)| id.clone())
         .collect();
     prune_candidates.sort();

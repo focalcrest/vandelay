@@ -75,6 +75,7 @@ pub struct ExportConfig {
 pub struct TypeCounts {
     pub created: u64,
     pub fetched: u64,
+    pub updated: u64,
     pub deleted: u64,
     pub skipped: u64,
     pub failed: u64,
