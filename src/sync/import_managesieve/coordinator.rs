@@ -420,7 +420,6 @@ fn account_id_for(auth: &ManageSieveAuth) -> String {
 
 #[derive(Debug)]
 enum SieveAuthError {
-
     TerminallyRefused(String),
 
     NoUsableMechanism(String),

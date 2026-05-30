@@ -28,6 +28,13 @@ CREATE TABLE IF NOT EXISTS sync_id_jmap (
 CREATE INDEX IF NOT EXISTS sync_id_jmap_local_idx
     ON sync_id_jmap (type_name, local_id);
 
+CREATE TABLE IF NOT EXISTS sync_state_jmap (
+    source_id   INTEGER NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+    type_name   TEXT    NOT NULL,
+    state       TEXT    NOT NULL,
+    PRIMARY KEY (source_id, type_name)
+);
+
 CREATE TABLE IF NOT EXISTS sync_id_imap (
     source_id    INTEGER NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
     type_name    TEXT    NOT NULL CHECK (type_name IN ('mailbox','email')),

@@ -379,7 +379,6 @@ fn qmail_root_only_maildir_imports_inbox_only() {
 }
 
 fn cyrus_export_fixture(root: &Path) {
-
     ensure_maildir(root);
     write_message(
         root,
@@ -537,7 +536,6 @@ fn rejects_path_without_cur_subdir() {
 
 #[test]
 fn rejects_dovecot_layout_fs_tree() {
-
     let td = TempDir::new().unwrap();
     ensure_maildir(td.path());
     for s in ["cur", "new", "tmp"] {
@@ -720,7 +718,6 @@ fn unreadable_file_is_counted_and_warned_not_aborted() {
 
 #[test]
 fn pointing_at_a_dot_subfolder_warns_but_imports() {
-
     let parent = TempDir::new().unwrap();
     ensure_maildir(parent.path());
     let sub = ensure_subfolder(parent.path(), ".Sent");
@@ -738,7 +735,6 @@ fn pointing_at_a_dot_subfolder_warns_but_imports() {
 
 #[test]
 fn malformed_message_yields_zero_message_match_but_imports() {
-
     let td = TempDir::new().unwrap();
     ensure_maildir(td.path());
     write_message(td.path(), "cur", "1.M0.host:2,S", b"");

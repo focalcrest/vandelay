@@ -331,7 +331,6 @@ mod tests {
 
     #[test]
     fn discover_rejects_dovecot_layout_fs_tree() {
-
         let td = tempfile::tempdir().unwrap();
         make_maildir(td.path(), &["Sent"]);
         let err = discover(td.path(), true).unwrap_err();

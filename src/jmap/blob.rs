@@ -21,7 +21,6 @@ where
 {
     match value {
         Value::Object(map) => {
-
             if let Some(Value::String(blob_id)) = map.remove("blobId") {
                 let local = resolve(&blob_id)?;
                 map.insert(SENTINEL_KEY.to_owned(), Value::from(local));

@@ -48,7 +48,6 @@ pub enum EmailKey {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EmailIndex {
-
     pub mids: Vec<String>,
 
     pub fb: [u8; 32],

@@ -433,7 +433,7 @@ fn import_removes_vanished_mailbox_from_archive_on_second_pass() {
         .mock("POST", api)
         .match_body(Matcher::Regex("Mailbox/get".into()))
         .with_body(
-            json!({"methodResponses":[["Mailbox/get",{"accountId":"w","list":[
+            json!({"methodResponses":[["Mailbox/get",{"accountId":"w","state":"s1","list":[
                 {"id":"A","name":"alpha","parentId":null,"role":null,"sortOrder":0,"isSubscribed":true},
                 {"id":"B","name":"bravo","parentId":null,"role":null,"sortOrder":0,"isSubscribed":true},
                 {"id":"C","name":"charlie","parentId":null,"role":null,"sortOrder":0,"isSubscribed":true}
@@ -473,6 +473,16 @@ fn import_removes_vanished_mailbox_from_archive_on_second_pass() {
         )
         .expect(1)
         .create();
+    let _ch2 = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("Mailbox/changes".into()))
+        .with_body(
+            json!({"methodResponses":[["Mailbox/changes",{"accountId":"w","oldState":"s1",
+                "newState":"s2","hasMoreChanges":false,"created":[],"updated":[],"destroyed":[]},"c"]]})
+            .to_string(),
+        )
+        .expect(1)
+        .create();
 
     let s2 = sync::import_jmap::run(
         common(&archive),
@@ -486,6 +496,7 @@ fn import_removes_vanished_mailbox_from_archive_on_second_pass() {
         .map(|(_, c)| c.clone())
         .expect("mailbox counts");
     assert_eq!(mb2.fetched, 0, "second pass fetches nothing");
+    assert_eq!(mb2.updated, 0, "no changed mailboxes reported");
     assert_eq!(mb2.deleted, 1, "vanished mailbox B is deleted");
     {
         let conn = rusqlite::Connection::open(&archive).unwrap();
@@ -502,7 +513,7 @@ fn import_removes_vanished_mailbox_from_archive_on_second_pass() {
 }
 
 #[test]
-fn import_present_item_change_on_server_is_not_propagated() {
+fn import_present_item_change_is_propagated_via_changes() {
     let mut server = mockito::Server::new();
     let base = server.url();
     let api = "/jmap/api";
@@ -530,7 +541,7 @@ fn import_present_item_change_on_server_is_not_propagated() {
         .mock("POST", api)
         .match_body(Matcher::Regex("Mailbox/get".into()))
         .with_body(
-            json!({"methodResponses":[["Mailbox/get",{"accountId":"w","list":[
+            json!({"methodResponses":[["Mailbox/get",{"accountId":"w","state":"s1","list":[
                 {"id":"A","name":"OriginalName","parentId":null,"role":null,"sortOrder":0,"isSubscribed":true}
             ],"notFound":[]},"g"]]})
             .to_string(),
@@ -543,6 +554,17 @@ fn import_present_item_change_on_server_is_not_propagated() {
         import_cfg_objects(&base, vec![ObjectType::Mailbox]),
     )
     .expect("first import");
+    {
+        let conn = rusqlite::Connection::open(&archive).unwrap();
+        let cursor: String = conn
+            .query_row(
+                "SELECT state FROM sync_state_jmap WHERE type_name='Mailbox'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("first import records the state cursor");
+        assert_eq!(cursor, "s1");
+    }
 
     let _q2 = server
         .mock("POST", api)
@@ -554,10 +576,29 @@ fn import_present_item_change_on_server_is_not_propagated() {
         )
         .expect(1)
         .create();
-    let nope_get = server
+    let changes = server
+        .mock("POST", api)
+        .match_body(Matcher::AllOf(vec![
+            Matcher::Regex("Mailbox/changes".into()),
+            Matcher::Regex("\"sinceState\":\"s1\"".into()),
+        ]))
+        .with_body(
+            json!({"methodResponses":[["Mailbox/changes",{"accountId":"w","oldState":"s1",
+                "newState":"s2","hasMoreChanges":false,"created":[],"updated":["A"],"destroyed":[]},"c"]]})
+            .to_string(),
+        )
+        .expect(1)
+        .create();
+    let _g2 = server
         .mock("POST", api)
         .match_body(Matcher::Regex("Mailbox/get".into()))
-        .expect(0)
+        .with_body(
+            json!({"methodResponses":[["Mailbox/get",{"accountId":"w","state":"s2","list":[
+                {"id":"A","name":"UpdatedName","parentId":null,"role":null,"sortOrder":0,"isSubscribed":true}
+            ],"notFound":[]},"g"]]})
+            .to_string(),
+        )
+        .expect(1)
         .create();
 
     let s2 = sync::import_jmap::run(
@@ -565,22 +606,34 @@ fn import_present_item_change_on_server_is_not_propagated() {
         import_cfg_objects(&base, vec![ObjectType::Mailbox]),
     )
     .expect("second import");
-    nope_get.assert();
+    changes.assert();
     let mb2 = s2
         .per_type
         .iter()
         .find(|(t, _)| *t == "Mailbox")
         .map(|(_, c)| c.clone())
         .expect("mailbox counts");
+    assert_eq!(mb2.fetched, 0, "no new objects on the second pass");
     assert_eq!(
-        mb2.fetched, 0,
-        "present items must not be re-fetched: changes on server are intentionally ignored"
+        mb2.updated, 1,
+        "the changed mailbox is detected via /changes and refreshed in place"
     );
-    let name: String = rusqlite::Connection::open(&archive)
-        .unwrap()
+    let conn = rusqlite::Connection::open(&archive).unwrap();
+    let name: String = conn
         .query_row("SELECT name FROM mailboxes WHERE id=1", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(name, "OriginalName", "archive name was not overwritten");
+    assert_eq!(
+        name, "UpdatedName",
+        "a server-side property change is propagated into the archive"
+    );
+    let cursor: String = conn
+        .query_row(
+            "SELECT state FROM sync_state_jmap WHERE type_name='Mailbox'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(cursor, "s2", "cursor advances to the changes newState");
     let _ = std::fs::remove_file(&archive);
 }
 
@@ -614,7 +667,7 @@ fn import_removes_vanished_email_and_drops_cross_ref() {
         .mock("POST", api)
         .match_body(Matcher::Regex("Mailbox/get".into()))
         .with_body(
-            json!({"methodResponses":[["Mailbox/get",{"accountId":"w","list":[
+            json!({"methodResponses":[["Mailbox/get",{"accountId":"w","state":"sm1","list":[
                 {"id":"MX","name":"Inbox","parentId":null,"role":"inbox","sortOrder":0,"isSubscribed":true}
             ],"notFound":[]},"g"]]})
             .to_string(),
@@ -635,7 +688,7 @@ fn import_removes_vanished_email_and_drops_cross_ref() {
         .mock("POST", api)
         .match_body(Matcher::Regex("Email/get".into()))
         .with_body(
-            json!({"methodResponses":[["Email/get",{"accountId":"w","list":[
+            json!({"methodResponses":[["Email/get",{"accountId":"w","state":"se1","list":[
                 {"id":"E1","blobId":"BLB1","receivedAt":"2020-01-01T00:00:00Z","mailboxIds":{"MX":true},"keywords":{"$seen":true}},
                 {"id":"E2","blobId":"BLB2","receivedAt":"2020-01-02T00:00:00Z","mailboxIds":{"MX":true},"keywords":{}}
             ],"notFound":[]},"g"]]})
@@ -684,6 +737,26 @@ fn import_removes_vanished_email_and_drops_cross_ref() {
         .with_body(
             json!({"methodResponses":[["Email/query",
                 {"accountId":"w","ids":["E2"]},"q"]]})
+            .to_string(),
+        )
+        .expect(1)
+        .create();
+    let _mbch2 = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("Mailbox/changes".into()))
+        .with_body(
+            json!({"methodResponses":[["Mailbox/changes",{"accountId":"w","oldState":"sm1",
+                "newState":"sm2","hasMoreChanges":false,"created":[],"updated":[],"destroyed":[]},"c"]]})
+            .to_string(),
+        )
+        .expect(1)
+        .create();
+    let _ech2 = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("Email/changes".into()))
+        .with_body(
+            json!({"methodResponses":[["Email/changes",{"accountId":"w","oldState":"se1",
+                "newState":"se2","hasMoreChanges":false,"created":[],"updated":[],"destroyed":[]},"c"]]})
             .to_string(),
         )
         .expect(1)
@@ -1297,7 +1370,10 @@ fn export_sieve_scripts_identical_content_different_names_both_created() {
         counts.created, 2,
         "two scripts with identical content but distinct names must both reach the target"
     );
-    assert_eq!(counts.skipped, 0, "neither distinct name collapses onto the other");
+    assert_eq!(
+        counts.skipped, 0,
+        "neither distinct name collapses onto the other"
+    );
     assert_eq!(counts.failed, 0);
     let _ = std::fs::remove_file(&archive);
 }
@@ -1537,5 +1613,737 @@ fn import_dry_run_does_not_write_archive_or_download_blobs() {
         .query_row("SELECT count(*) FROM sources", [], |r| r.get(0))
         .unwrap();
     assert_eq!(source_rows, 0, "dry-run must not record the JMAP source");
+    let _ = std::fs::remove_file(&archive);
+}
+
+#[test]
+fn import_email_keyword_change_is_propagated_without_blob_refetch() {
+    let mut server = mockito::Server::new();
+    let base = server.url();
+    let api = "/jmap/api";
+    let archive = tmp();
+
+    let _root = server.mock("GET", "/").with_status(404).create();
+    let _wk = server
+        .mock("GET", "/.well-known/jmap")
+        .with_body(session_body_full(&base))
+        .expect_at_least(1)
+        .create();
+    let _mbterm = anchor_terminator(&mut server, api, "Mailbox");
+    let _emterm = anchor_terminator(&mut server, api, "Email");
+
+    let _mbq1 = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("Mailbox/query".into()))
+        .with_body(
+            json!({"methodResponses":[["Mailbox/query",{"accountId":"w","ids":["MX"]},"q"]]})
+                .to_string(),
+        )
+        .expect(1)
+        .create();
+    let _mbg1 = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("Mailbox/get".into()))
+        .with_body(json!({"methodResponses":[["Mailbox/get",{"accountId":"w","state":"sm1","list":[
+            {"id":"MX","name":"Inbox","parentId":null,"role":"inbox","sortOrder":0,"isSubscribed":true}
+        ],"notFound":[]},"g"]]}).to_string())
+        .expect(1)
+        .create();
+    let _eq1 = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("Email/query".into()))
+        .with_body(
+            json!({"methodResponses":[["Email/query",{"accountId":"w","ids":["E1"]},"q"]]})
+                .to_string(),
+        )
+        .expect(1)
+        .create();
+    let _eg1 = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("Email/get".into()))
+        .with_body(json!({"methodResponses":[["Email/get",{"accountId":"w","state":"se1","list":[
+            {"id":"E1","blobId":"BLB1","receivedAt":"2020-01-01T00:00:00Z","mailboxIds":{"MX":true},"keywords":{"$seen":true}}
+        ],"notFound":[]},"g"]]}).to_string())
+        .expect(1)
+        .create();
+    let _dl1 = server
+        .mock("GET", Matcher::Regex("/jmap/dl/w/BLB1/.*".into()))
+        .with_body("From: a@x\r\nMessage-ID: <1@h>\r\n\r\nbody-one")
+        .expect(1)
+        .create();
+
+    sync::import_jmap::run(
+        common(&archive),
+        import_cfg_objects(&base, vec![ObjectType::Mailbox, ObjectType::Email]),
+    )
+    .expect("first import");
+
+    let _mbq2 = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("Mailbox/query".into()))
+        .with_body(
+            json!({"methodResponses":[["Mailbox/query",{"accountId":"w","ids":["MX"]},"q"]]})
+                .to_string(),
+        )
+        .expect(1)
+        .create();
+    let _mbch2 = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("Mailbox/changes".into()))
+        .with_body(json!({"methodResponses":[["Mailbox/changes",{"accountId":"w","oldState":"sm1","newState":"sm2","hasMoreChanges":false,"created":[],"updated":[],"destroyed":[]},"c"]]}).to_string())
+        .expect(1)
+        .create();
+    let _eq2 = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("Email/query".into()))
+        .with_body(
+            json!({"methodResponses":[["Email/query",{"accountId":"w","ids":["E1"]},"q"]]})
+                .to_string(),
+        )
+        .expect(1)
+        .create();
+    let echanges = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("Email/changes".into()))
+        .with_body(json!({"methodResponses":[["Email/changes",{"accountId":"w","oldState":"se1","newState":"se2","hasMoreChanges":false,"created":[],"updated":["E1"],"destroyed":[]},"c"]]}).to_string())
+        .expect(1)
+        .create();
+    let _eg2 = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("Email/get".into()))
+        .with_body(
+            json!({"methodResponses":[["Email/get",{"accountId":"w","state":"se2","list":[
+            {"id":"E1","mailboxIds":{"MX":true},"keywords":{"$seen":true,"$flagged":true}}
+        ],"notFound":[]},"g"]]})
+            .to_string(),
+        )
+        .expect(1)
+        .create();
+    let no_blob_refetch = server
+        .mock("GET", Matcher::Regex("/jmap/dl/w/BLB1/.*".into()))
+        .with_body("should-not-be-fetched")
+        .expect(0)
+        .create();
+
+    let s2 = sync::import_jmap::run(
+        common(&archive),
+        import_cfg_objects(&base, vec![ObjectType::Mailbox, ObjectType::Email]),
+    )
+    .expect("second import");
+    echanges.assert();
+    no_blob_refetch.assert();
+    let em2 = s2
+        .per_type
+        .iter()
+        .find(|(t, _)| *t == "Email")
+        .map(|(_, c)| c.clone())
+        .expect("email counts");
+    assert_eq!(em2.updated, 1, "the changed email is refreshed");
+    assert_eq!(em2.fetched, 0, "no new emails");
+    let conn = rusqlite::Connection::open(&archive).unwrap();
+    let kw: String = conn
+        .query_row("SELECT keywords FROM emails LIMIT 1", [], |r| r.get(0))
+        .unwrap();
+    assert!(
+        kw.contains("$seen") && kw.contains("$flagged"),
+        "keyword change propagated into the archive: {kw}"
+    );
+    let blobs: i64 = conn
+        .query_row("SELECT count(*) FROM blobs", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(
+        blobs, 1,
+        "the immutable body blob is not re-downloaded on update"
+    );
+    let _ = std::fs::remove_file(&archive);
+}
+
+#[test]
+fn import_cannot_calculate_changes_falls_back_to_full_refresh() {
+    let mut server = mockito::Server::new();
+    let base = server.url();
+    let api = "/jmap/api";
+    let archive = tmp();
+
+    let _root = server.mock("GET", "/").with_status(404).create();
+    let _wk = server
+        .mock("GET", "/.well-known/jmap")
+        .with_body(session_body_full(&base))
+        .expect_at_least(1)
+        .create();
+    let _term = anchor_terminator(&mut server, api, "Mailbox");
+
+    let _q1 = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("Mailbox/query".into()))
+        .with_body(
+            json!({"methodResponses":[["Mailbox/query",{"accountId":"w","ids":["A"]},"q"]]})
+                .to_string(),
+        )
+        .expect(1)
+        .create();
+    let _g1 = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("Mailbox/get".into()))
+        .with_body(json!({"methodResponses":[["Mailbox/get",{"accountId":"w","state":"s1","list":[
+            {"id":"A","name":"OriginalName","parentId":null,"role":null,"sortOrder":0,"isSubscribed":true}
+        ],"notFound":[]},"g"]]}).to_string())
+        .expect(1)
+        .create();
+
+    sync::import_jmap::run(
+        common(&archive),
+        import_cfg_objects(&base, vec![ObjectType::Mailbox]),
+    )
+    .expect("first import");
+
+    let _q2 = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("Mailbox/query".into()))
+        .with_body(
+            json!({"methodResponses":[["Mailbox/query",{"accountId":"w","ids":["A"]},"q"]]})
+                .to_string(),
+        )
+        .expect(1)
+        .create();
+    let cannot = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("Mailbox/changes".into()))
+        .with_body(
+            json!({"methodResponses":[["error",{"type":"cannotCalculateChanges"},"c"]]})
+                .to_string(),
+        )
+        .expect(1)
+        .create();
+    let capture_state = server
+        .mock("POST", api)
+        .match_body(Matcher::AllOf(vec![
+            Matcher::Regex("Mailbox/get".into()),
+            Matcher::Regex("\"ids\":\\[\\]".into()),
+        ]))
+        .with_body(json!({"methodResponses":[["Mailbox/get",{"accountId":"w","state":"s9","list":[],"notFound":[]},"g"]]}).to_string())
+        .expect(1)
+        .create();
+    let refresh_get = server
+        .mock("POST", api)
+        .match_body(Matcher::AllOf(vec![
+            Matcher::Regex("Mailbox/get".into()),
+            Matcher::Regex("\"A\"".into()),
+        ]))
+        .with_body(json!({"methodResponses":[["Mailbox/get",{"accountId":"w","state":"s9","list":[
+            {"id":"A","name":"RefreshedName","parentId":null,"role":null,"sortOrder":0,"isSubscribed":true}
+        ],"notFound":[]},"g"]]}).to_string())
+        .expect(1)
+        .create();
+
+    let s2 = sync::import_jmap::run(
+        common(&archive),
+        import_cfg_objects(&base, vec![ObjectType::Mailbox]),
+    )
+    .expect("second import");
+    cannot.assert();
+    capture_state.assert();
+    refresh_get.assert();
+    let mb2 = s2
+        .per_type
+        .iter()
+        .find(|(t, _)| *t == "Mailbox")
+        .map(|(_, c)| c.clone())
+        .expect("mailbox counts");
+    assert_eq!(mb2.updated, 1, "fallback refreshes the present object");
+    let conn = rusqlite::Connection::open(&archive).unwrap();
+    let name: String = conn
+        .query_row("SELECT name FROM mailboxes WHERE id=1", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(name, "RefreshedName", "A-fallback propagated the change");
+    let cursor: String = conn
+        .query_row(
+            "SELECT state FROM sync_state_jmap WHERE type_name='Mailbox'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        cursor, "s9",
+        "fallback captured a fresh cursor for the next run"
+    );
+    let _ = std::fs::remove_file(&archive);
+}
+
+#[test]
+fn import_failed_update_holds_cursor_for_retry() {
+    let mut server = mockito::Server::new();
+    let base = server.url();
+    let api = "/jmap/api";
+    let archive = tmp();
+
+    let _root = server.mock("GET", "/").with_status(404).create();
+    let _wk = server
+        .mock("GET", "/.well-known/jmap")
+        .with_body(session_body_full(&base))
+        .expect_at_least(1)
+        .create();
+    let _mbterm = anchor_terminator(&mut server, api, "Mailbox");
+    let _emterm = anchor_terminator(&mut server, api, "Email");
+
+    let _mbq1 = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("Mailbox/query".into()))
+        .with_body(
+            json!({"methodResponses":[["Mailbox/query",{"accountId":"w","ids":["MX"]},"q"]]})
+                .to_string(),
+        )
+        .expect(1)
+        .create();
+    let _mbg1 = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("Mailbox/get".into()))
+        .with_body(json!({"methodResponses":[["Mailbox/get",{"accountId":"w","state":"sm1","list":[
+            {"id":"MX","name":"Inbox","parentId":null,"role":"inbox","sortOrder":0,"isSubscribed":true}
+        ],"notFound":[]},"g"]]}).to_string())
+        .expect(1)
+        .create();
+    let _eq1 = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("Email/query".into()))
+        .with_body(
+            json!({"methodResponses":[["Email/query",{"accountId":"w","ids":["E1"]},"q"]]})
+                .to_string(),
+        )
+        .expect(1)
+        .create();
+    let _eg1 = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("Email/get".into()))
+        .with_body(json!({"methodResponses":[["Email/get",{"accountId":"w","state":"se1","list":[
+            {"id":"E1","blobId":"BLB1","receivedAt":"2020-01-01T00:00:00Z","mailboxIds":{"MX":true},"keywords":{"$seen":true}}
+        ],"notFound":[]},"g"]]}).to_string())
+        .expect(1)
+        .create();
+    let _dl1 = server
+        .mock("GET", Matcher::Regex("/jmap/dl/w/BLB1/.*".into()))
+        .with_body("From: a@x\r\nMessage-ID: <1@h>\r\n\r\nbody-one")
+        .expect(1)
+        .create();
+
+    sync::import_jmap::run(
+        common(&archive),
+        import_cfg_objects(&base, vec![ObjectType::Mailbox, ObjectType::Email]),
+    )
+    .expect("first import");
+
+    let _mbq2 = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("Mailbox/query".into()))
+        .with_body(
+            json!({"methodResponses":[["Mailbox/query",{"accountId":"w","ids":["MX"]},"q"]]})
+                .to_string(),
+        )
+        .expect(1)
+        .create();
+    let _mbch2 = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("Mailbox/changes".into()))
+        .with_body(json!({"methodResponses":[["Mailbox/changes",{"accountId":"w","oldState":"sm1","newState":"sm2","hasMoreChanges":false,"created":[],"updated":[],"destroyed":[]},"c"]]}).to_string())
+        .expect(1)
+        .create();
+    let _eq2 = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("Email/query".into()))
+        .with_body(
+            json!({"methodResponses":[["Email/query",{"accountId":"w","ids":["E1"]},"q"]]})
+                .to_string(),
+        )
+        .expect(1)
+        .create();
+    let _ech2 = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("Email/changes".into()))
+        .with_body(json!({"methodResponses":[["Email/changes",{"accountId":"w","oldState":"se1","newState":"se2","hasMoreChanges":false,"created":[],"updated":["E1"],"destroyed":[]},"c"]]}).to_string())
+        .expect(1)
+        .create();
+    let bad_update = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("Email/get".into()))
+        .with_body(
+            json!({"methodResponses":[["Email/get",{"accountId":"w","state":"se2","list":[
+            {"id":"E1","mailboxIds":{},"keywords":{"$seen":true,"$flagged":true}}
+        ],"notFound":[]},"g"]]})
+            .to_string(),
+        )
+        .expect(1)
+        .create();
+
+    let s2 = sync::import_jmap::run(
+        common(&archive),
+        import_cfg_objects(&base, vec![ObjectType::Mailbox, ObjectType::Email]),
+    )
+    .expect("second import");
+    bad_update.assert();
+    let em2 = s2
+        .per_type
+        .iter()
+        .find(|(t, _)| *t == "Email")
+        .map(|(_, c)| c.clone())
+        .expect("email counts");
+    assert_eq!(
+        em2.updated, 0,
+        "the failed update is not counted as applied"
+    );
+    assert!(em2.failed >= 1, "the unresolvable update is counted failed");
+    let conn = rusqlite::Connection::open(&archive).unwrap();
+    let cursor: String = conn
+        .query_row(
+            "SELECT state FROM sync_state_jmap WHERE type_name='Email'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        cursor, "se1",
+        "cursor is held at the pre-change state so the failed update retries next run"
+    );
+    let _ = std::fs::remove_file(&archive);
+}
+
+#[test]
+fn import_unknown_method_changes_falls_back_to_full_refresh() {
+    let mut server = mockito::Server::new();
+    let base = server.url();
+    let api = "/jmap/api";
+    let archive = tmp();
+
+    let _root = server.mock("GET", "/").with_status(404).create();
+    let _wk = server
+        .mock("GET", "/.well-known/jmap")
+        .with_body(session_body_full(&base))
+        .expect_at_least(1)
+        .create();
+    let _term = anchor_terminator(&mut server, api, "Mailbox");
+
+    let _q1 = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("Mailbox/query".into()))
+        .with_body(
+            json!({"methodResponses":[["Mailbox/query",{"accountId":"w","ids":["A"]},"q"]]})
+                .to_string(),
+        )
+        .expect(1)
+        .create();
+    let _g1 = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("Mailbox/get".into()))
+        .with_body(json!({"methodResponses":[["Mailbox/get",{"accountId":"w","state":"s1","list":[
+            {"id":"A","name":"OriginalName","parentId":null,"role":null,"sortOrder":0,"isSubscribed":true}
+        ],"notFound":[]},"g"]]}).to_string())
+        .expect(1)
+        .create();
+
+    sync::import_jmap::run(
+        common(&archive),
+        import_cfg_objects(&base, vec![ObjectType::Mailbox]),
+    )
+    .expect("first import");
+
+    let _q2 = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("Mailbox/query".into()))
+        .with_body(
+            json!({"methodResponses":[["Mailbox/query",{"accountId":"w","ids":["A"]},"q"]]})
+                .to_string(),
+        )
+        .expect(1)
+        .create();
+    let unknown = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("Mailbox/changes".into()))
+        .with_body(json!({"methodResponses":[["error",{"type":"unknownMethod"},"c"]]}).to_string())
+        .expect(1)
+        .create();
+    let _capture_state = server
+        .mock("POST", api)
+        .match_body(Matcher::AllOf(vec![
+            Matcher::Regex("Mailbox/get".into()),
+            Matcher::Regex("\"ids\":\\[\\]".into()),
+        ]))
+        .with_body(json!({"methodResponses":[["Mailbox/get",{"accountId":"w","state":"s9","list":[],"notFound":[]},"g"]]}).to_string())
+        .expect(1)
+        .create();
+    let refresh_get = server
+        .mock("POST", api)
+        .match_body(Matcher::AllOf(vec![
+            Matcher::Regex("Mailbox/get".into()),
+            Matcher::Regex("\"A\"".into()),
+        ]))
+        .with_body(json!({"methodResponses":[["Mailbox/get",{"accountId":"w","state":"s9","list":[
+            {"id":"A","name":"RefreshedName","parentId":null,"role":null,"sortOrder":0,"isSubscribed":true}
+        ],"notFound":[]},"g"]]}).to_string())
+        .expect(1)
+        .create();
+
+    let s2 = sync::import_jmap::run(
+        common(&archive),
+        import_cfg_objects(&base, vec![ObjectType::Mailbox]),
+    )
+    .expect("second import");
+    unknown.assert();
+    refresh_get.assert();
+    let mb2 = s2
+        .per_type
+        .iter()
+        .find(|(t, _)| *t == "Mailbox")
+        .map(|(_, c)| c.clone())
+        .expect("mailbox counts");
+    assert_eq!(
+        mb2.updated, 1,
+        "a server without Mailbox/changes degrades to a full refresh instead of aborting"
+    );
+    let conn = rusqlite::Connection::open(&archive).unwrap();
+    let name: String = conn
+        .query_row("SELECT name FROM mailboxes WHERE id=1", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(name, "RefreshedName");
+    let _ = std::fs::remove_file(&archive);
+}
+
+fn sieve_get_body(name: &str, blob: &str) -> String {
+    json!({"methodResponses":[["SieveScript/get",{"accountId":"w","state":"x","list":[
+        {"id":"S1","name":name,"isActive":true,"blobId":blob}
+    ],"notFound":[]},"g"]]})
+    .to_string()
+}
+
+#[test]
+fn import_sieve_script_reimport_unchanged_is_convergent() {
+    let mut server = mockito::Server::new();
+    let base = server.url();
+    let api = "/jmap/api";
+    let archive = tmp();
+
+    let _root = server.mock("GET", "/").with_status(404).create();
+    let _wk = server
+        .mock("GET", "/.well-known/jmap")
+        .with_body(session_body_full(&base))
+        .expect_at_least(1)
+        .create();
+    let _term = anchor_terminator(&mut server, api, "SieveScript");
+    let _dl = server
+        .mock("GET", Matcher::Regex("/jmap/dl/w/B1/.*".into()))
+        .with_body("keep;\n")
+        .create();
+
+    let _q1 = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("SieveScript/query".into()))
+        .with_body(
+            json!({"methodResponses":[["SieveScript/query",{"accountId":"w","ids":["S1"]},"q"]]})
+                .to_string(),
+        )
+        .expect(1)
+        .create();
+    let _g1 = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("SieveScript/get".into()))
+        .with_body(sieve_get_body("main", "B1"))
+        .expect(1)
+        .create();
+
+    sync::import_jmap::run(
+        common(&archive),
+        import_cfg_objects(&base, vec![ObjectType::SieveScript]),
+    )
+    .expect("first import");
+
+    let _q2 = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("SieveScript/query".into()))
+        .with_body(
+            json!({"methodResponses":[["SieveScript/query",{"accountId":"w","ids":["S1"]},"q"]]})
+                .to_string(),
+        )
+        .expect(1)
+        .create();
+    let _g2 = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("SieveScript/get".into()))
+        .with_body(sieve_get_body("main", "B1"))
+        .expect(1)
+        .create();
+
+    let s2 = sync::import_jmap::run(
+        common(&archive),
+        import_cfg_objects(&base, vec![ObjectType::SieveScript]),
+    )
+    .expect("second import");
+    let ss = s2
+        .per_type
+        .iter()
+        .find(|(t, _)| *t == "SieveScript")
+        .map(|(_, c)| c.clone())
+        .expect("sieve counts");
+    assert_eq!(ss.created, 0, "no new scripts");
+    assert_eq!(
+        ss.updated, 0,
+        "an unchanged SieveScript must not be counted as updated on re-import (convergent)"
+    );
+    let _ = std::fs::remove_file(&archive);
+}
+
+#[test]
+fn import_sieve_script_content_change_is_propagated() {
+    let mut server = mockito::Server::new();
+    let base = server.url();
+    let api = "/jmap/api";
+    let archive = tmp();
+
+    let _root = server.mock("GET", "/").with_status(404).create();
+    let _wk = server
+        .mock("GET", "/.well-known/jmap")
+        .with_body(session_body_full(&base))
+        .expect_at_least(1)
+        .create();
+    let _term = anchor_terminator(&mut server, api, "SieveScript");
+    let _dl1 = server
+        .mock("GET", Matcher::Regex("/jmap/dl/w/B1/.*".into()))
+        .with_body("keep;\n")
+        .create();
+    let _dl2 = server
+        .mock("GET", Matcher::Regex("/jmap/dl/w/B2/.*".into()))
+        .with_body("discard;\n")
+        .create();
+
+    let _q1 = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("SieveScript/query".into()))
+        .with_body(
+            json!({"methodResponses":[["SieveScript/query",{"accountId":"w","ids":["S1"]},"q"]]})
+                .to_string(),
+        )
+        .expect(1)
+        .create();
+    let _g1 = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("SieveScript/get".into()))
+        .with_body(sieve_get_body("main", "B1"))
+        .expect(1)
+        .create();
+
+    sync::import_jmap::run(
+        common(&archive),
+        import_cfg_objects(&base, vec![ObjectType::SieveScript]),
+    )
+    .expect("first import");
+
+    let _q2 = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("SieveScript/query".into()))
+        .with_body(
+            json!({"methodResponses":[["SieveScript/query",{"accountId":"w","ids":["S1"]},"q"]]})
+                .to_string(),
+        )
+        .expect(1)
+        .create();
+    let _g2 = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("SieveScript/get".into()))
+        .with_body(sieve_get_body("main", "B2"))
+        .expect(1)
+        .create();
+
+    let s2 = sync::import_jmap::run(
+        common(&archive),
+        import_cfg_objects(&base, vec![ObjectType::SieveScript]),
+    )
+    .expect("second import");
+    let ss = s2
+        .per_type
+        .iter()
+        .find(|(t, _)| *t == "SieveScript")
+        .map(|(_, c)| c.clone())
+        .expect("sieve counts");
+    assert_eq!(
+        ss.updated, 1,
+        "the changed script content is re-fetched and updated"
+    );
+    let conn = rusqlite::Connection::open(&archive).unwrap();
+    let body: Vec<u8> = conn
+        .query_row(
+            "SELECT b.data FROM blobs b JOIN sieve_scripts s ON s.blob_id = b.id LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        String::from_utf8(body).unwrap(),
+        "discard;\n",
+        "new script content propagated into the archive blob"
+    );
+    let _ = std::fs::remove_file(&archive);
+}
+
+#[test]
+fn first_run_cursor_is_captured_up_front_not_from_the_fetch() {
+    let mut server = mockito::Server::new();
+    let base = server.url();
+    let api = "/jmap/api";
+    let archive = tmp();
+
+    let _root = server.mock("GET", "/").with_status(404).create();
+    let _wk = server
+        .mock("GET", "/.well-known/jmap")
+        .with_body(session_body_full(&base))
+        .expect_at_least(1)
+        .create();
+    let _term = anchor_terminator(&mut server, api, "Mailbox");
+    let _q = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("Mailbox/query".into()))
+        .with_body(
+            json!({"methodResponses":[["Mailbox/query",{"accountId":"w","ids":["A"]},"q"]]})
+                .to_string(),
+        )
+        .expect(1)
+        .create();
+    // Up-front state snapshot (ids:[]) reports an EARLIER state than the new-fetch.
+    let _state = server
+        .mock("POST", api)
+        .match_body(Matcher::AllOf(vec![
+            Matcher::Regex("Mailbox/get".into()),
+            Matcher::Regex("\"ids\":\\[\\]".into()),
+        ]))
+        .with_body(json!({"methodResponses":[["Mailbox/get",{"accountId":"w","state":"before","list":[],"notFound":[]},"g"]]}).to_string())
+        .expect(1)
+        .create();
+    // The new-fetch reports a LATER state; if we (incorrectly) captured from here, the cursor
+    // would be "after" and an object changed mid-run could be missed next run.
+    let _g = server
+        .mock("POST", api)
+        .match_body(Matcher::AllOf(vec![
+            Matcher::Regex("Mailbox/get".into()),
+            Matcher::Regex("\"A\"".into()),
+        ]))
+        .with_body(json!({"methodResponses":[["Mailbox/get",{"accountId":"w","state":"after","list":[
+            {"id":"A","name":"Personal","parentId":null,"role":null,"sortOrder":0,"isSubscribed":true}
+        ],"notFound":[]},"g"]]}).to_string())
+        .expect(1)
+        .create();
+
+    sync::import_jmap::run(
+        common(&archive),
+        import_cfg_objects(&base, vec![ObjectType::Mailbox]),
+    )
+    .expect("import");
+    let cursor: String = rusqlite::Connection::open(&archive)
+        .unwrap()
+        .query_row(
+            "SELECT state FROM sync_state_jmap WHERE type_name='Mailbox'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        cursor, "before",
+        "cursor must be the pre-fetch snapshot (lower bound), not the post-fetch state"
+    );
     let _ = std::fs::remove_file(&archive);
 }

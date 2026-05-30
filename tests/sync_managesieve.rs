@@ -209,7 +209,6 @@ fn managesieve_second_run_is_convergent() {
 #[test]
 #[ignore = "requires Docker"]
 fn managesieve_and_jmap_imports_share_blob_bytes() {
-
     let fx = seeder::provision(base_url()).expect("provision");
     let acc = fx.account("test1").expect("test1");
     let msieve_archive = tmp_archive("parity-msieve");
@@ -310,7 +309,6 @@ fn managesieve_dry_run_reports_diff_without_writing() {
 #[test]
 #[ignore = "requires Docker"]
 fn managesieve_source_change_protection_refuses_second_account() {
-
     let fx = seeder::provision(base_url()).expect("provision");
     let acc1 = fx.account("test1").expect("test1");
     let acc2 = fx.account("test2").expect("test2");
@@ -330,7 +328,6 @@ fn managesieve_source_change_protection_refuses_second_account() {
 #[test]
 #[ignore = "requires Docker"]
 fn managesieve_implicit_tls_path_succeeds_when_offered() {
-
     let fx = seeder::provision(base_url()).expect("provision");
     let acc = fx.account("test1").expect("test1");
     let archive = tmp_archive("implicit_tls");
@@ -350,7 +347,6 @@ fn managesieve_implicit_tls_path_succeeds_when_offered() {
 #[test]
 #[ignore = "requires Docker"]
 fn managesieve_round_trip_via_jmap_export_converges() {
-
     let fx = seeder::provision(base_url()).expect("provision");
     let src = fx.account("test1").expect("test1");
     let dst = fx.account("test4").expect("test4");

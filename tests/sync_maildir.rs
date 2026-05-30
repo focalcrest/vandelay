@@ -428,7 +428,6 @@ fn dry_run_then_real_run_produces_same_counts_for_new() {
 
 #[test]
 fn trashed_flag_added_between_runs_deletes_present_row() {
-
     let td = tempfile::TempDir::new().unwrap();
     ensure_maildir(td.path());
     let path = write(
@@ -459,7 +458,6 @@ fn trashed_flag_added_between_runs_deletes_present_row() {
 #[cfg(unix)]
 #[test]
 fn symlinked_subfolder_is_followed_and_appears_as_its_own_folder() {
-
     let td = tempfile::TempDir::new().unwrap();
     ensure_maildir(td.path());
     let real = ensure_subfolder(td.path(), ".Real");
@@ -602,7 +600,6 @@ fn blob_hashes(conn: &Connection) -> std::collections::HashSet<String> {
 #[test]
 #[ignore = "requires Docker"]
 fn maildir_message_count_matches_jmap_for_same_corpus() {
-
     let fx = seeder::provision(base_url()).expect("provision");
     let acc = fx.account("test1").expect("test1");
     let corpus = seeder::data::load_mbox(30).expect("mbox corpus");

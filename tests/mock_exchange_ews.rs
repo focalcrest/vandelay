@@ -454,7 +454,6 @@ fn mailbox_kinds_are_three_separate_sources() {
 
 #[test]
 fn get_item_batches_chunk_the_id_list() {
-
     let ids: Vec<ItemId> = (0..7).map(|i| ItemId::new(format!("I{i}"), "K")).collect();
     let chunks: Vec<&[ItemId]> = ids.chunks(3).collect();
     assert_eq!(chunks.len(), 3);

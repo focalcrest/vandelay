@@ -26,7 +26,7 @@ use crate::jmap::blobxfer;
 use crate::jmap::connect::{self, Connected};
 use crate::jmap::error::JmapError;
 use crate::jmap::http::{Auth, HttpClient};
-use crate::jmap::request::{get_all, get_objects, query_all_ids};
+use crate::jmap::request::{get_all, get_changes, get_objects, get_state, query_all_ids};
 use crate::jmap::session::{Limits, Session};
 use crate::jmap::wire::JmapId;
 use crate::jmap::wire::email::Email;
@@ -80,7 +80,7 @@ fn get_props(ty: ObjectType) -> Option<&'static [&'static str]> {
     }
 }
 
-type GetMsg = Result<(Vec<Value>, usize), JmapError>;
+type GetMsg = Result<Vec<Value>, JmapError>;
 type BlobRef = (String, String, String);
 type DlMsg = (String, Result<Vec<u8>, JmapError>);
 
@@ -271,30 +271,31 @@ fn reconcile_type(
     };
     let local_ids: HashSet<String> = local_map.keys().cloned().collect();
 
-    let (server_ids, preloaded): (Vec<JmapId>, Option<Vec<Value>>) = if is_queryless(ty) {
-        let got = get_all::<Value>(&net.client, &net.api, &net.account, ty.jmap_name())
+    let (server_ids, preloaded, enum_state): (Vec<JmapId>, Option<Vec<Value>>, Option<String>) =
+        if is_queryless(ty) {
+            let got = get_all::<Value>(&net.client, &net.api, &net.account, ty.jmap_name())
+                .map_err(Error::from)?;
+            let ids = got
+                .list
+                .iter()
+                .filter_map(|v| {
+                    v.get("id")
+                        .and_then(Value::as_str)
+                        .map(|s| JmapId(s.to_owned()))
+                })
+                .collect();
+            (ids, Some(got.list), got.state)
+        } else {
+            let ids = query_all_ids(
+                &net.client,
+                &net.api,
+                &net.account,
+                ty.jmap_name(),
+                &net.limits,
+            )
             .map_err(Error::from)?;
-        let ids = got
-            .list
-            .iter()
-            .filter_map(|v| {
-                v.get("id")
-                    .and_then(Value::as_str)
-                    .map(|s| JmapId(s.to_owned()))
-            })
-            .collect();
-        (ids, Some(got.list))
-    } else {
-        let ids = query_all_ids(
-            &net.client,
-            &net.api,
-            &net.account,
-            ty.jmap_name(),
-            &net.limits,
-        )
-        .map_err(Error::from)?;
-        (ids, None)
-    };
+            (ids, None, None)
+        };
 
     let d = diff(&server_ids, &local_ids);
 
@@ -310,6 +311,18 @@ fn reconcile_type(
 
     let source_id = source_id.expect("source_id present outside dry-run");
 
+    let cursor = db::sync_state_jmap::get(&ctx.conn, source_id, ty)
+        .map_err(|e| Error::Partial(e.to_string()))?;
+    let run_state = if !supports_changes(ty) {
+        None
+    } else if is_queryless(ty) {
+        enum_state
+    } else if cursor.is_none() {
+        get_state(&net.client, &net.api, &net.account, ty.jmap_name()).map_err(Error::from)?
+    } else {
+        None
+    };
+
     if !d.new.is_empty() {
         let objects = match preloaded {
             Some(list) => {
@@ -323,7 +336,7 @@ fn reconcile_type(
                     })
                     .collect()
             }
-            None => fetch_objects(net, ty, &d.new, threads, logger, counts),
+            None => fetch_objects(net, ty, &d.new, get_props(ty), threads, logger, counts),
         };
         insert_objects(ctx, net, ty, source_id, objects, threads, logger, counts)?;
     }
@@ -332,6 +345,10 @@ fn reconcile_type(
         delete_vanished(&ctx.conn, ty, source_id, &d.vanished, &local_map, logger)?;
         counts.deleted += d.vanished.len() as u64;
     }
+
+    reconcile_updates(
+        ctx, net, ty, source_id, &d.present, &local_map, cursor, run_state, threads, logger, counts,
+    )?;
 
     if logger.enabled(LEVEL_DEFAULT) {
         eprintln!(
@@ -350,18 +367,17 @@ fn fetch_objects(
     net: &Net,
     ty: ObjectType,
     new_ids: &[JmapId],
+    props: Option<&'static [&'static str]>,
     threads: usize,
     logger: &Logger,
     counts: &mut TypeCounts,
 ) -> Vec<Value> {
     let chunk = net.limits.max_objects_in_get.max(1) as usize;
-    let props = get_props(ty);
     let workers = effective_workers(threads, &net.limits, false);
     let net = Arc::new(net.clone());
     let pool: Pool<Vec<JmapId>, GetMsg> = Pool::new(workers, {
         let net = net.clone();
         move |ids: Vec<JmapId>| {
-            let n = ids.len();
             get_objects::<Value>(
                 &net.client,
                 &net.api,
@@ -371,7 +387,7 @@ fn fetch_objects(
                 props,
                 &net.limits,
             )
-            .map(|r| (r.list, n))
+            .map(|r| r.list)
         }
     });
 
@@ -384,7 +400,7 @@ fn fetch_objects(
     let mut done = 0u64;
     for res in pool.finish() {
         match res {
-            Ok((list, _)) => out.extend(list),
+            Ok(list) => out.extend(list),
             Err(e) => {
                 logger.warn(&format!("{} /get chunk failed: {e}", ty.jmap_name()));
                 counts.failed += 1;
@@ -685,6 +701,248 @@ fn insert_one(
             let w = serde_json::from_value(obj.clone())?;
             let mut bi = PrefetchedBlobs { conn, bytes: blobs };
             mapping::insert_calendar_event(conn, &w, &resolver, &mut bi)
+        }
+    }
+}
+
+fn supports_changes(ty: ObjectType) -> bool {
+    !matches!(ty, ObjectType::SieveScript)
+}
+
+fn update_props(ty: ObjectType) -> Option<&'static [&'static str]> {
+    match ty {
+        ObjectType::Email => Some(&["mailboxIds", "keywords"]),
+        other => get_props(other),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn reconcile_updates(
+    ctx: &Context,
+    net: &Net,
+    ty: ObjectType,
+    source_id: i64,
+    present: &[JmapId],
+    local_map: &HashMap<String, i64>,
+    cursor: Option<String>,
+    run_state: Option<String>,
+    threads: usize,
+    logger: &Logger,
+    counts: &mut TypeCounts,
+) -> Result<(), Error> {
+    if supports_changes(ty)
+        && let Some(since) = cursor
+    {
+        match get_changes(
+            &net.client,
+            &net.api,
+            &net.account,
+            ty.jmap_name(),
+            &since,
+            &net.limits,
+        ) {
+            Ok(ch) => {
+                let present_set: HashSet<&str> = present.iter().map(|j| j.0.as_str()).collect();
+                let updated: Vec<JmapId> = ch
+                    .updated
+                    .into_iter()
+                    .filter(|j| present_set.contains(j.0.as_str()))
+                    .collect();
+                let clean = fetch_and_update(
+                    ctx, net, ty, source_id, &updated, local_map, threads, logger, counts,
+                )?;
+                advance_state(ctx, ty, source_id, &ch.new_state, clean, logger)?;
+            }
+            Err(err)
+                if matches!(
+                    err,
+                    JmapError::CannotCalculateChanges | JmapError::UnknownMethod
+                ) =>
+            {
+                let reason = if matches!(err, JmapError::UnknownMethod) {
+                    "server does not implement /changes"
+                } else {
+                    "server cannot calculate changes from stored state"
+                };
+                logger.warn(&format!(
+                    "{}: {reason}; refreshing all present objects",
+                    ty.jmap_name()
+                ));
+                let captured = get_state(&net.client, &net.api, &net.account, ty.jmap_name())
+                    .map_err(Error::from)?;
+                let clean = fetch_and_update(
+                    ctx, net, ty, source_id, present, local_map, threads, logger, counts,
+                )?;
+                if let Some(s) = captured {
+                    advance_state(ctx, ty, source_id, &s, clean, logger)?;
+                }
+            }
+            Err(e) => return Err(Error::from(e)),
+        }
+        return Ok(());
+    }
+
+    let clean = fetch_and_update(
+        ctx, net, ty, source_id, present, local_map, threads, logger, counts,
+    )?;
+    if let Some(s) = run_state {
+        advance_state(ctx, ty, source_id, &s, clean, logger)?;
+    }
+    Ok(())
+}
+
+fn advance_state(
+    ctx: &Context,
+    ty: ObjectType,
+    source_id: i64,
+    state: &str,
+    clean: bool,
+    logger: &Logger,
+) -> Result<(), Error> {
+    if !clean {
+        logger.warn(&format!(
+            "{}: holding sync state; some updates failed and will be retried on the next run",
+            ty.jmap_name()
+        ));
+        return Ok(());
+    }
+    db::sync_state_jmap::upsert(&ctx.conn, source_id, ty, state)
+        .map_err(|e| Error::Partial(e.to_string()))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn fetch_and_update(
+    ctx: &Context,
+    net: &Net,
+    ty: ObjectType,
+    source_id: i64,
+    ids: &[JmapId],
+    local_map: &HashMap<String, i64>,
+    threads: usize,
+    logger: &Logger,
+    counts: &mut TypeCounts,
+) -> Result<bool, Error> {
+    if ids.is_empty() {
+        return Ok(true);
+    }
+    let failed_before = counts.failed;
+    let objects = fetch_objects(net, ty, ids, update_props(ty), threads, logger, counts);
+    update_objects(
+        ctx, net, ty, source_id, objects, local_map, threads, logger, counts,
+    )?;
+    Ok(counts.failed == failed_before)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn update_objects(
+    ctx: &Context,
+    net: &Net,
+    ty: ObjectType,
+    source_id: i64,
+    objects: Vec<Value>,
+    local_map: &HashMap<String, i64>,
+    threads: usize,
+    logger: &Logger,
+    counts: &mut TypeCounts,
+) -> Result<(), Error> {
+    let blob_refs = blob_references(ty, &objects);
+    let blobs = if blob_refs.is_empty() {
+        HashMap::new()
+    } else {
+        download_blobs(net, blob_refs, threads, logger, counts)
+    };
+
+    for batch in objects.chunks(200) {
+        let tx = ctx
+            .conn
+            .unchecked_transaction()
+            .map_err(|e| Error::Partial(e.to_string()))?;
+        for obj in batch {
+            let jmap_id = match obj.get("id").and_then(Value::as_str) {
+                Some(s) => s.to_owned(),
+                None => {
+                    counts.failed += 1;
+                    continue;
+                }
+            };
+            let Some(&local_id) = local_map.get(&jmap_id) else {
+                continue;
+            };
+            match update_one(&tx, ty, source_id, local_id, obj, &blobs) {
+                Ok(true) => counts.updated += 1,
+                Ok(false) => {}
+                Err(e) => {
+                    logger.warn(&format!("{} {jmap_id} update skipped: {e}", ty.jmap_name()));
+                    counts.failed += 1;
+                }
+            }
+        }
+        tx.commit().map_err(|e| Error::Partial(e.to_string()))?;
+    }
+    Ok(())
+}
+
+fn update_one(
+    conn: &Connection,
+    ty: ObjectType,
+    source_id: i64,
+    local_id: i64,
+    obj: &Value,
+    blobs: &HashMap<String, Vec<u8>>,
+) -> Result<bool, JmapError> {
+    let resolver = DbResolver { conn, source_id };
+    match ty {
+        ObjectType::Mailbox => {
+            let w = serde_json::from_value(obj.clone())?;
+            mapping::update_mailbox(conn, local_id, &w, &resolver)
+        }
+        ObjectType::Identity => {
+            let w = serde_json::from_value(obj.clone())?;
+            mapping::update_identity(conn, local_id, &w)
+        }
+        ObjectType::AddressBook => {
+            let w = serde_json::from_value(obj.clone())?;
+            mapping::update_address_book(conn, local_id, &w)
+        }
+        ObjectType::Calendar => {
+            let w = serde_json::from_value(obj.clone())?;
+            mapping::update_calendar(conn, local_id, &w)
+        }
+        ObjectType::ParticipantIdentity => {
+            let w = serde_json::from_value(obj.clone())?;
+            mapping::update_participant_identity(conn, local_id, &w)
+        }
+        ObjectType::Email => mapping::update_email(conn, local_id, obj, &resolver),
+        ObjectType::SieveScript => {
+            let w: SieveScript = serde_json::from_value(obj.clone())?;
+            let data = blobs
+                .get(&w.blob_id.0)
+                .ok_or_else(|| JmapError::malformed("sieve blob missing"))?;
+            let blob_local = db::blobs::intern_blob(conn, data)?;
+            mapping::update_sieve_script(conn, local_id, &w, blob_local)
+        }
+        ObjectType::FileNode => {
+            let w: FileNode = serde_json::from_value(obj.clone())?;
+            let blob_local = match (&w.node_type, &w.blob_id) {
+                (NodeType::File, Some(b)) => {
+                    let data = blobs
+                        .get(&b.0)
+                        .ok_or_else(|| JmapError::malformed("file blob missing"))?;
+                    Some(db::blobs::intern_blob(conn, data)?)
+                }
+                _ => None,
+            };
+            mapping::update_file_node(conn, local_id, &w, blob_local, &resolver)
+        }
+        ObjectType::ContactCard => {
+            let w = serde_json::from_value(obj.clone())?;
+            let mut bi = PrefetchedBlobs { conn, bytes: blobs };
+            mapping::update_contact_card(conn, local_id, &w, &resolver, &mut bi)
+        }
+        ObjectType::CalendarEvent => {
+            let w = serde_json::from_value(obj.clone())?;
+            let mut bi = PrefetchedBlobs { conn, bytes: blobs };
+            mapping::update_calendar_event(conn, local_id, &w, &resolver, &mut bi)
         }
     }
 }

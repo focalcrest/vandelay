@@ -384,7 +384,6 @@ mod tests {
 
     #[test]
     fn deflate_reads_decompressed_payload_from_inner() {
-
         let mut peer = PeerStream::new();
         let mut compressor = flate2::Compress::new(flate2::Compression::default(), false);
         let plaintext = b"* OK [CAPABILITY IMAP4rev2 COMPRESS=DEFLATE] hi\r\n";

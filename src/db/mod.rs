@@ -15,4 +15,5 @@ pub mod init;
 pub mod maildir_ids;
 pub mod managesieve_ids;
 pub mod sources;
+pub mod sync_state_jmap;
 pub mod takeout_ids;

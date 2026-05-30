@@ -10,7 +10,9 @@ use serde_json::json;
 use vandelay::jmap::account::{self, AccountSelector};
 use vandelay::jmap::error::JmapError;
 use vandelay::jmap::http::{Auth, HttpClient, RetryPolicy};
-use vandelay::jmap::request::{self, SetRequest, get_all, get_objects, set_call};
+use vandelay::jmap::request::{
+    self, SetRequest, get_all, get_changes, get_objects, get_state, set_call,
+};
 use vandelay::jmap::session::{Limits, Session};
 use vandelay::jmap::wire::JmapId;
 use vandelay::jmap::wire::identity::Identity;
@@ -1039,4 +1041,131 @@ fn shared_throttle_level_grows_across_concurrent_workers() {
         shared.retries_observed() >= 2,
         "both workers saw a 429 (or more) before recovery"
     );
+}
+
+#[test]
+fn get_changes_paginates_until_no_more() {
+    let mut server = mockito::Server::new();
+    let api = "/jmap/api";
+    let _p1 = server
+        .mock("POST", api)
+        .match_body(mockito::Matcher::Regex("\"sinceState\":\"s1\"".into()))
+        .with_body(
+            json!({"methodResponses":[["Mailbox/changes",{"accountId":"w","oldState":"s1",
+                "newState":"s2","hasMoreChanges":true,"created":["A"],"updated":["U1"],
+                "destroyed":["D1"]},"c"]]})
+            .to_string(),
+        )
+        .expect(1)
+        .create();
+    let _p2 = server
+        .mock("POST", api)
+        .match_body(mockito::Matcher::Regex("\"sinceState\":\"s2\"".into()))
+        .with_body(
+            json!({"methodResponses":[["Mailbox/changes",{"accountId":"w","oldState":"s2",
+                "newState":"s3","hasMoreChanges":false,"created":[],"updated":["U2"],
+                "destroyed":[]},"c"]]})
+            .to_string(),
+        )
+        .expect(1)
+        .create();
+
+    let url = format!("{}{}", server.url(), api);
+    let r = get_changes(&client(0), &url, "w", "Mailbox", "s1", &limits(500)).expect("changes");
+    let updated: Vec<String> = r.updated.iter().map(|i| i.0.clone()).collect();
+    assert_eq!(updated, vec!["U1".to_owned(), "U2".to_owned()]);
+    let created: Vec<String> = r.created.iter().map(|i| i.0.clone()).collect();
+    assert_eq!(created, vec!["A".to_owned()]);
+    let destroyed: Vec<String> = r.destroyed.iter().map(|i| i.0.clone()).collect();
+    assert_eq!(destroyed, vec!["D1".to_owned()]);
+    assert_eq!(r.new_state, "s3", "cursor advances to the final newState");
+}
+
+#[test]
+fn get_changes_cannot_calculate_changes_is_typed_error() {
+    let mut server = mockito::Server::new();
+    let api = "/jmap/api";
+    let _m = server
+        .mock("POST", api)
+        .with_body(
+            json!({"methodResponses":[["error",{"type":"cannotCalculateChanges"},"c"]]})
+                .to_string(),
+        )
+        .create();
+    let url = format!("{}{}", server.url(), api);
+    let err =
+        get_changes(&client(0), &url, "w", "Email", "stale", &limits(500)).expect_err("must error");
+    assert!(
+        matches!(err, JmapError::CannotCalculateChanges),
+        "got {err:?}"
+    );
+}
+
+#[test]
+fn get_changes_dedups_repeated_ids_across_pages() {
+    let mut server = mockito::Server::new();
+    let api = "/jmap/api";
+    let _p1 = server
+        .mock("POST", api)
+        .match_body(mockito::Matcher::Regex("\"sinceState\":\"s1\"".into()))
+        .with_body(
+            json!({"methodResponses":[["Mailbox/changes",{"accountId":"w","oldState":"s1",
+                "newState":"s2","hasMoreChanges":true,"created":[],"updated":["U1","U2"],
+                "destroyed":[]},"c"]]})
+            .to_string(),
+        )
+        .expect(1)
+        .create();
+    let _p2 = server
+        .mock("POST", api)
+        .match_body(mockito::Matcher::Regex("\"sinceState\":\"s2\"".into()))
+        .with_body(
+            json!({"methodResponses":[["Mailbox/changes",{"accountId":"w","oldState":"s2",
+                "newState":"s3","hasMoreChanges":false,"created":[],"updated":["U1","U3"],
+                "destroyed":[]},"c"]]})
+            .to_string(),
+        )
+        .expect(1)
+        .create();
+
+    let url = format!("{}{}", server.url(), api);
+    let r = get_changes(&client(0), &url, "w", "Mailbox", "s1", &limits(500)).expect("changes");
+    let updated: Vec<String> = r.updated.iter().map(|i| i.0.clone()).collect();
+    assert_eq!(
+        updated,
+        vec!["U1".to_owned(), "U2".to_owned(), "U3".to_owned()],
+        "an id repeated across pages is fetched once, first-seen order preserved"
+    );
+}
+
+#[test]
+fn get_changes_unknown_method_is_typed_error() {
+    let mut server = mockito::Server::new();
+    let api = "/jmap/api";
+    let _m = server
+        .mock("POST", api)
+        .with_body(json!({"methodResponses":[["error",{"type":"unknownMethod"},"c"]]}).to_string())
+        .create();
+    let url = format!("{}{}", server.url(), api);
+    let err =
+        get_changes(&client(0), &url, "w", "Email", "s1", &limits(500)).expect_err("must error");
+    assert!(matches!(err, JmapError::UnknownMethod), "got {err:?}");
+}
+
+#[test]
+fn get_state_reads_state_from_empty_get() {
+    let mut server = mockito::Server::new();
+    let api = "/jmap/api";
+    let _m = server
+        .mock("POST", api)
+        .match_body(mockito::Matcher::Regex("Email/get".into()))
+        .with_body(
+            json!({"methodResponses":[["Email/get",{"accountId":"w","state":"snap-1",
+                "list":[],"notFound":[]},"g"]]})
+            .to_string(),
+        )
+        .create();
+    let url = format!("{}{}", server.url(), api);
+    let st = get_state(&client(0), &url, "w", "Email").expect("get_state");
+    assert_eq!(st.as_deref(), Some("snap-1"));
 }

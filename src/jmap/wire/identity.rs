@@ -11,7 +11,6 @@ use super::{EmailAddress, JmapId};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Identity {
-
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id: Option<JmapId>,
 

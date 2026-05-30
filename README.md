@@ -9,13 +9,17 @@
 <br>
 
 <p align="center">
-  <a href="https://crates.io/crates/vandelay"><img src="https://img.shields.io/crates/v/vandelay?style=flat-square" alt="crates.io"></a>
+  <a href="https://github.com/stalwartlabs/vandelay/actions/workflows/release.yml"><img src="https://img.shields.io/github/actions/workflow/status/stalwartlabs/vandelay/release.yml?style=flat-square" alt="build"></a>
   &nbsp;
-  <a href="https://github.com/stalwartlabs/vandelay/actions/workflows/rust.yml"><img src="https://img.shields.io/github/actions/workflow/status/stalwartlabs/vandelay/rust.yml?style=flat-square" alt="build"></a>
+  <a href="https://github.com/stalwartlabs/vandelay/releases/latest"><img src="https://img.shields.io/github/v/release/stalwartlabs/vandelay?style=flat-square" alt="release"></a>
   &nbsp;
-  <a href="https://docs.rs/vandelay"><img src="https://img.shields.io/docsrs/vandelay?style=flat-square" alt="docs.rs"></a>
+  <a href="https://www.npmjs.com/package/@stalwartlabs/vandelay"><img src="https://img.shields.io/npm/v/@stalwartlabs/vandelay?style=flat-square&logo=npm" alt="npm"></a>
   &nbsp;
-  <a href="http://www.apache.org/licenses/LICENSE-2.0"><img src="https://img.shields.io/crates/l/vandelay?style=flat-square" alt="license"></a>
+  <a href="https://github.com/stalwartlabs/vandelay/releases"><img src="https://img.shields.io/github/downloads/stalwartlabs/vandelay/total?style=flat-square" alt="downloads"></a>
+  &nbsp;
+  <img src="https://img.shields.io/badge/platforms-macOS%20%7C%20Linux%20%7C%20Windows-blue?style=flat-square" alt="platforms">
+  &nbsp;
+  <a href="#license"><img src="https://img.shields.io/badge/license-MIT%2FApache--2.0-blue?style=flat-square" alt="license"></a>
 </p>
 
 <br>
@@ -288,13 +292,44 @@ Read-only dump of a local archive. This command never opens a network connection
 
 ## Testing
 
+The default suite is hermetic (unit tests plus `mockito`-scripted JMAP/DAV/EWS/Graph behaviours) and needs no network or Docker:
+
 ```sh
 cargo build
 cargo clippy --all-targets
 cargo test
 ```
 
-Live integration tests against a Stalwart server and container-based smoke tests against third-party servers (Dovecot, Cyrus, Radicale, Baikal, Apache `mod_dav`) are gated behind `--ignored` and require Docker plus the seeder fixtures.
+### Live and integration tests (Docker required)
+
+Live integration tests against a Stalwart server and container-based  tests against third-party servers (Dovecot, Cyrus, Radicale, Baikal, Apache `mod_dav`) are gated behind `--ignored`. **They require a running Docker daemon**: each test binary boots its own throwaway container via `testcontainers` (images are pulled automatically on first run), so Docker must be installed and `docker info` must succeed before invoking them.
+
+Run them per binary, and always with `--test-threads=1`:
+
+```sh
+cargo test --test sync_jmap          -- --ignored --test-threads=1   # live JMAP import/export/convergence/prune
+cargo test --test sync_imap          -- --ignored --test-threads=1
+cargo test --test sync_managesieve   -- --ignored --test-threads=1
+cargo test --test sync_maildir       -- --ignored --test-threads=1
+cargo test --test sync_caldav        -- --ignored --test-threads=1
+cargo test --test sync_carddav       -- --ignored --test-threads=1
+cargo test --test sync_webdav        -- --ignored --test-threads=1
+cargo test --test live_stalwart      -- --ignored --test-threads=1
+cargo test --test seed_smoke         -- --ignored --test-threads=1
+cargo test --test seed_only          -- --ignored --test-threads=1
+
+# Third-party-server tests (one container each):
+cargo test --test integration_radicale -- --ignored --test-threads=1
+cargo test --test integration_baikal   -- --ignored --test-threads=1
+cargo test --test integration_webdav   -- --ignored --test-threads=1
+cargo test --test integration_dovecot  -- --ignored --test-threads=1
+cargo test --test integration_cyrus    -- --ignored --test-threads=1
+
+# Slow tests
+cargo test --test mock_jmap -- --ignored
+```
+
+`--test-threads=1` is mandatory, not just advisory: within a binary every test shares a single per-binary container, and each test provisions then tears down the same disposable `vandelay.org` domain (and opens the archive with SQLite `EXCLUSIVE` locking). Separate binaries are isolated (each boots its own container on dynamic host ports), so plain `cargo test --test <name>` invocations are safe to run one after another.
 
 ## License
 

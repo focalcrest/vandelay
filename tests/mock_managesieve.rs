@@ -533,7 +533,6 @@ fn vanished_script_is_deleted_locally() {
 
 #[test]
 fn active_flag_flip_does_not_violate_partial_unique_index() {
-
     let seed: Script = Box::new(|conn| {
         auth_then(conn, |c| {
             let _ = c.read_line()?;
@@ -580,7 +579,6 @@ fn active_flag_flip_does_not_violate_partial_unique_index() {
 
 #[test]
 fn resume_after_partial_run_completes_remainder() {
-
     let seed: Script = Box::new(|conn| {
         auth_then(conn, |c| {
             let _ = c.read_line()?;
@@ -694,7 +692,6 @@ fn transient_no_on_getscript_retries_then_succeeds() {
 
 #[test]
 fn bye_mid_listscripts_reconnects_and_succeeds() {
-
     let first: Script = Box::new(|conn| {
         conn.write_capability("PLAIN", false)?;
         conn.write_line("OK")?;
@@ -749,7 +746,6 @@ fn bye_mid_listscripts_reconnects_and_succeeds() {
 
 #[test]
 fn bye_mid_getscript_reconnects_and_completes_remaining_scripts() {
-
     let first: Script = Box::new(|conn| {
         conn.write_capability("PLAIN", false)?;
         conn.write_line("OK")?;
@@ -812,7 +808,6 @@ fn bye_mid_getscript_reconnects_and_completes_remaining_scripts() {
 
 #[test]
 fn post_auth_unsolicited_capability_is_consumed() {
-
     let server = MockSieveServer::start(|conn| {
         conn.write_capability("PLAIN", false)?;
         conn.write_line("OK")?;
@@ -994,7 +989,6 @@ fn three_scripts_with_middle_active_lands_the_middle_active() {
 
 #[test]
 fn transient_no_exhausting_max_retries_skips_script_and_followup_picks_it_up() {
-
     let archive = tempfile("retry_exhaustion");
     let first = MockSieveServer::start(|conn| {
         auth_then(conn, |c| {

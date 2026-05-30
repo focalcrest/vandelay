@@ -11,8 +11,11 @@ use std::path::{Path, PathBuf};
 
 use integration::stalwart::shared as shared_stalwart;
 use rusqlite::Connection;
-use vandelay::jmap::account::AccountSelector;
-use vandelay::jmap::http::Auth;
+use serde_json::{Map, Value, json};
+use vandelay::jmap::account::{self, AccountSelector};
+use vandelay::jmap::http::{Auth, HttpClient, RetryPolicy};
+use vandelay::jmap::request::Request;
+use vandelay::jmap::session::Session;
 use vandelay::logging::Logger;
 use vandelay::sync::{self, CommonConfig, ConnectConfig, ExportConfig, ImportConfig};
 
@@ -1147,4 +1150,91 @@ fn live_blob_quota_429_triggers_retry_after_then_succeeds() {
 
     drop(_ttl_guard);
     seeder::teardown(base_url()).expect("teardown");
+}
+
+#[test]
+#[ignore = "requires Docker"]
+fn import_delta_propagates_email_keyword_change_via_changes() {
+    let fx = seeder::provision(base_url()).expect("provision");
+    let acc = fx.account("test1").expect("test1");
+    let archive = tmp_archive("delta-email");
+
+    sync::import_jmap::run(
+        common(&archive, false),
+        import_cfg(AccountSelector::Id(acc.account_id.clone())),
+    )
+    .expect("first import");
+
+    let (jmap_id, local_id): (String, i64) = {
+        let conn = Connection::open(&archive).unwrap();
+        conn.query_row(
+            "SELECT s.jmap_id, s.local_id FROM sync_id_jmap s
+             JOIN emails e ON e.id = s.local_id
+             WHERE s.type_name = 'Email' AND e.keywords NOT LIKE '%$flagged%'
+             LIMIT 1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .expect("an unflagged email exists in the archive")
+    };
+
+    let client = HttpClient::new(basic("test1"), RetryPolicy::new(5), true);
+    let session = Session::discover(&client, base_url()).expect("session discovered");
+    let account = account::resolve(
+        &AccountSelector::Id(acc.account_id.clone()),
+        &session,
+        &client,
+    )
+    .expect("account resolved");
+    let mut update = Map::new();
+    update.insert(jmap_id.clone(), json!({ "keywords/$flagged": true }));
+    let mut req = Request::new();
+    req.call(
+        "Email/set",
+        json!({ "accountId": account, "update": Value::Object(update) }),
+        "s",
+    );
+    let resp = req.send(&client, &session.api_url).expect("Email/set sent");
+    let mr = resp.first().expect("a method response");
+    assert!(
+        mr.args
+            .get("updated")
+            .and_then(|u| u.get(&jmap_id))
+            .is_some(),
+        "server accepted the keyword update: {:?}",
+        mr.args
+    );
+
+    let s2 = sync::import_jmap::run(
+        common(&archive, false),
+        import_cfg(AccountSelector::Id(acc.account_id.clone())),
+    )
+    .expect("second import");
+
+    let conn = Connection::open(&archive).unwrap();
+    let kw: String = conn
+        .query_row(
+            "SELECT keywords FROM emails WHERE id = ?1",
+            [local_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(
+        kw.contains("$flagged"),
+        "delta re-import propagated the new flag into the archive: {kw}"
+    );
+    let em = s2
+        .per_type
+        .iter()
+        .find(|(t, _)| *t == "Email")
+        .map(|(_, c)| c.clone())
+        .expect("email counts");
+    assert!(
+        em.updated >= 1,
+        "the changed email was detected via Email/changes and refreshed (updated={})",
+        em.updated
+    );
+    drop(conn);
+    seeder::teardown(base_url()).expect("teardown");
+    let _ = std::fs::remove_file(&archive);
 }

@@ -807,7 +807,11 @@ fn coordinator_present_run_is_convergent() {
     assert_eq!(email.1.deleted, 0, "convergent run deletes nothing");
     assert_eq!(email.1.updated, 0, "unchanged flags update nothing");
     let dbc = Connection::open(&archive).unwrap();
-    assert_eq!(count(&dbc, "blobs"), 1, "no body re-fetched on a present-only run");
+    assert_eq!(
+        count(&dbc, "blobs"),
+        1,
+        "no body re-fetched on a present-only run"
+    );
 }
 
 #[test]
@@ -830,7 +834,10 @@ fn coordinator_present_flag_change_updates_keywords() {
         .iter()
         .find(|(k, _)| *k == "email")
         .unwrap();
-    assert_eq!(email.1.updated, 1, "a changed flag set is counted as updated");
+    assert_eq!(
+        email.1.updated, 1,
+        "a changed flag set is counted as updated"
+    );
     assert_eq!(email.1.created, 0, "present message is not re-created");
     assert_eq!(email.1.fetched, 0, "no body fetched on a present-only run");
     let dbc = Connection::open(&archive).unwrap();
@@ -869,7 +876,11 @@ fn coordinator_present_newly_deleted_is_left_intact() {
         "a present message that newly gained \\Deleted is skipped, not updated"
     );
     let dbc = Connection::open(&archive).unwrap();
-    assert_eq!(count(&dbc, "emails"), 1, "the archived message is preserved");
+    assert_eq!(
+        count(&dbc, "emails"),
+        1,
+        "the archived message is preserved"
+    );
     let kw: String = dbc
         .query_row("SELECT keywords FROM emails LIMIT 1", [], |r| r.get(0))
         .unwrap();
@@ -1080,7 +1091,6 @@ fn coordinator_dispatches_to_multiple_worker_connections() {
                     continue;
                 }
                 if cmd.starts_with("UID FETCH") {
-
                     let after = cmd.strip_prefix("UID FETCH ").unwrap_or("");
                     let set = after.split_whitespace().next().unwrap_or("");
                     let uids = parse_uid_set(set);

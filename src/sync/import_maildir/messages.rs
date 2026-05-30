@@ -76,7 +76,6 @@ pub fn list_folder(folder_path: &Path) -> std::io::Result<DiskListing> {
                 continue;
             }
             if seen.contains_key(&unique_id) {
-
                 continue;
             }
             let flags = flags_from_filename(&filename);
@@ -173,7 +172,6 @@ pub fn insert_new(
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PresentOutcome {
-
     Unchanged,
 
     KeywordsUpdated,

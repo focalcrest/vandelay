@@ -141,7 +141,6 @@ mod tests {
 
     #[test]
     fn permanent_codes_override_text_match() {
-
         assert!(!NoError::new("try again later", Some("QUOTA".into())).is_transient());
         assert!(!NoError::new("temporarily", Some("AUTH-TOO-WEAK".into())).is_transient());
         assert!(!NoError::new("rate limit", Some("TRANSITION-NEEDED".into())).is_transient());

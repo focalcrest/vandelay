@@ -33,6 +33,12 @@ pub enum JmapError {
     #[error("query anchor not found")]
     AnchorNotFound,
 
+    #[error("server cannot calculate changes from the stored state")]
+    CannotCalculateChanges,
+
+    #[error("server does not implement the requested method")]
+    UnknownMethod,
+
     #[error("jmap method error in call {call_id}: {error_type}{}", .description.as_deref().map(|d| format!(" ({d})")).unwrap_or_default())]
     Method {
         call_id: String,

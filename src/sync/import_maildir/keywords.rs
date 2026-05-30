@@ -182,7 +182,6 @@ mod tests {
 
     #[test]
     fn flags_from_filename_dovecot_extension_metadata_passes_through() {
-
         let mut flags = flags_from_filename("uid,S=1234,W=1300:2,RS");
         flags.sort();
         let mut want = vec![Flag::Replied, Flag::Seen];
@@ -192,7 +191,6 @@ mod tests {
 
     #[test]
     fn flags_from_filename_unknown_alpha_chars_skipped() {
-
         let mut flags = flags_from_filename("uid:2,SaT");
         flags.sort();
         let mut want = vec![Flag::Seen, Flag::Trashed];

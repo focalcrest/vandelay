@@ -165,6 +165,12 @@ pub fn check_method_error(mr: &MethodCall) -> Result<(), JmapError> {
     if error_type == "anchorNotFound" {
         return Err(JmapError::AnchorNotFound);
     }
+    if error_type == "cannotCalculateChanges" {
+        return Err(JmapError::CannotCalculateChanges);
+    }
+    if error_type == "unknownMethod" {
+        return Err(JmapError::UnknownMethod);
+    }
     let description = mr
         .args
         .get("description")
@@ -263,6 +269,7 @@ fn query_pages(
 pub struct GetResult<T> {
     pub list: Vec<T>,
     pub not_found: Vec<JmapId>,
+    pub state: Option<String>,
 }
 
 impl<T> Default for GetResult<T> {
@@ -270,6 +277,7 @@ impl<T> Default for GetResult<T> {
         GetResult {
             list: Vec::new(),
             not_found: Vec::new(),
+            state: None,
         }
     }
 }
@@ -380,6 +388,97 @@ pub fn get_all<T: DeserializeOwned>(
     Ok(out)
 }
 
+pub fn get_state(
+    client: &HttpClient,
+    api_url: &str,
+    account_id: &str,
+    type_name: &str,
+) -> Result<Option<String>, JmapError> {
+    let mut args = Map::new();
+    args.insert("accountId".to_owned(), Value::String(account_id.to_owned()));
+    args.insert("ids".to_owned(), Value::Array(Vec::new()));
+    let mut req = Request::new();
+    req.call(format!("{type_name}/get"), Value::Object(args), "g");
+    let resp = req.send(client, api_url)?;
+    let mr = resp.first()?;
+    check_method_error(mr)?;
+    let mut out: GetResult<Value> = GetResult::default();
+    decode_get(mr, &mut out)?;
+    Ok(out.state)
+}
+
+#[derive(Debug, Default)]
+pub struct ChangesResult {
+    pub created: Vec<JmapId>,
+    pub updated: Vec<JmapId>,
+    pub destroyed: Vec<JmapId>,
+    pub new_state: String,
+}
+
+pub fn get_changes(
+    client: &HttpClient,
+    api_url: &str,
+    account_id: &str,
+    type_name: &str,
+    since_state: &str,
+    limits: &Limits,
+) -> Result<ChangesResult, JmapError> {
+    let mut out = ChangesResult::default();
+    let mut since = since_state.to_owned();
+    loop {
+        let mut args = Map::new();
+        args.insert("accountId".to_owned(), Value::String(account_id.to_owned()));
+        args.insert("sinceState".to_owned(), Value::String(since.clone()));
+        args.insert(
+            "maxChanges".to_owned(),
+            Value::from(limits.max_objects_in_get.max(1)),
+        );
+        let mut req = Request::new();
+        req.call(format!("{type_name}/changes"), Value::Object(args), "c");
+        let resp = req.send(client, api_url)?;
+        let mr = resp.first()?;
+        check_method_error(mr)?;
+        let new_state = mr
+            .args
+            .get("newState")
+            .and_then(Value::as_str)
+            .ok_or_else(|| JmapError::malformed("changes response has no newState"))?
+            .to_owned();
+        append_id_array(&mr.args, "created", &mut out.created);
+        append_id_array(&mr.args, "updated", &mut out.updated);
+        append_id_array(&mr.args, "destroyed", &mut out.destroyed);
+        let has_more = mr
+            .args
+            .get("hasMoreChanges")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        out.new_state = new_state.clone();
+        if !has_more || since == new_state {
+            break;
+        }
+        since = new_state;
+    }
+    dedup_ids(&mut out.created);
+    dedup_ids(&mut out.updated);
+    dedup_ids(&mut out.destroyed);
+    Ok(out)
+}
+
+fn append_id_array(args: &Value, key: &str, out: &mut Vec<JmapId>) {
+    if let Some(arr) = args.get(key).and_then(Value::as_array) {
+        for v in arr {
+            if let Some(s) = v.as_str() {
+                out.push(JmapId(s.to_owned()));
+            }
+        }
+    }
+}
+
+fn dedup_ids(ids: &mut Vec<JmapId>) {
+    let mut seen = IndexSet::new();
+    ids.retain(|id| seen.insert(id.0.clone()));
+}
+
 fn decode_get<T: DeserializeOwned>(
     mr: &MethodCall,
     out: &mut GetResult<T>,
@@ -398,6 +497,9 @@ fn decode_get<T: DeserializeOwned>(
                 out.not_found.push(JmapId(s.to_owned()));
             }
         }
+    }
+    if let Some(s) = mr.args.get("state").and_then(Value::as_str) {
+        out.state = Some(s.to_owned());
     }
     Ok(())
 }

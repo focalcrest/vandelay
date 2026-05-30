@@ -12,7 +12,6 @@ use super::{JmapId, UtcDate};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Email {
-
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id: Option<JmapId>,
 
@@ -29,7 +28,6 @@ pub struct Email {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EmailImport {
-
     pub blob_id: JmapId,
 
     pub mailbox_ids: IndexMap<JmapId, bool>,
