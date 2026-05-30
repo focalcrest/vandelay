@@ -7,26 +7,9 @@
 use std::collections::HashSet;
 use std::fs;
 use std::io;
-#[cfg(unix)]
-use std::os::unix::fs::MetadataExt;
-#[cfg(windows)]
-use std::os::windows::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 use crate::logging::Logger;
-
-#[cfg(unix)]
-fn fingerprint(metadata: &fs::Metadata) -> (u64, u64) {
-    (metadata.dev(), metadata.ino())
-}
-
-#[cfg(windows)]
-fn fingerprint(metadata: &fs::Metadata) -> (u64, u64) {
-    (
-        u64::from(metadata.volume_serial_number().unwrap_or(0)),
-        metadata.file_index().unwrap_or(0),
-    )
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum FileKind {
@@ -76,7 +59,7 @@ pub fn walk(root: &Path) -> io::Result<WalkResult> {
 
 pub fn walk_with_logger(root: &Path, logger: Logger) -> io::Result<WalkResult> {
     let mut result = WalkResult::default();
-    let mut visited: HashSet<(u64, u64)> = HashSet::new();
+    let mut visited: HashSet<PathBuf> = HashSet::new();
     walk_dir(root, &mut result, &mut visited, logger)?;
     result.files.sort_by(|a, b| a.path.cmp(&b.path));
     Ok(result)
@@ -85,12 +68,11 @@ pub fn walk_with_logger(root: &Path, logger: Logger) -> io::Result<WalkResult> {
 fn walk_dir(
     dir: &Path,
     result: &mut WalkResult,
-    visited: &mut HashSet<(u64, u64)>,
+    visited: &mut HashSet<PathBuf>,
     logger: Logger,
 ) -> io::Result<()> {
-    let metadata = fs::metadata(dir)?;
-    let key = fingerprint(&metadata);
-    if !visited.insert(key) {
+    let canonical = fs::canonicalize(dir)?;
+    if !visited.insert(canonical) {
         result.symlink_cycles += 1;
         logger.warn(&format!(
             "takeout walk: symlink cycle broken at {dir:?} (target already visited)"

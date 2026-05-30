@@ -88,6 +88,13 @@ jobs:
       - name: Install dependencies
         run: |
           ${{ matrix.packages_install }}
+      - name: Update Rust toolchain to current stable
+        shell: bash
+        run: |
+          if command -v rustup > /dev/null 2>&1; then
+            rustup update stable
+            rustup default stable
+          fi
       - name: Build artifacts
         run: |
           # Actually do builds and make zips and whatnot
