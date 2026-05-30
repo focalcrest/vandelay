@@ -12,4 +12,4 @@ install-path = "CARGO_HOME"
 publish-jobs = ["homebrew", "npm"]
 install-updater = false
 github-attestations = true
-allow-dirty = ["ci"]
+allow-dirty = ["ci", "msi"]
