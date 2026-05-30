@@ -7,10 +7,26 @@
 use std::collections::HashSet;
 use std::fs;
 use std::io;
+#[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
+#[cfg(windows)]
+use std::os::windows::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 use crate::logging::Logger;
+
+#[cfg(unix)]
+fn fingerprint(metadata: &fs::Metadata) -> (u64, u64) {
+    (metadata.dev(), metadata.ino())
+}
+
+#[cfg(windows)]
+fn fingerprint(metadata: &fs::Metadata) -> (u64, u64) {
+    (
+        u64::from(metadata.volume_serial_number().unwrap_or(0)),
+        metadata.file_index().unwrap_or(0),
+    )
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum FileKind {
@@ -73,7 +89,7 @@ fn walk_dir(
     logger: Logger,
 ) -> io::Result<()> {
     let metadata = fs::metadata(dir)?;
-    let key = (metadata.dev(), metadata.ino());
+    let key = fingerprint(&metadata);
     if !visited.insert(key) {
         result.symlink_cycles += 1;
         logger.warn(&format!(
@@ -148,6 +164,7 @@ fn classify(path: &Path) -> Option<FileKind> {
 mod tests {
     use super::*;
     use std::fs;
+    #[cfg(unix)]
     use std::os::unix::fs::symlink;
     use tempfile::TempDir;
 
@@ -236,6 +253,7 @@ mod tests {
         assert_eq!(r.by_kind(FileKind::Vcf).count(), 0);
     }
 
+    #[cfg(unix)]
     #[test]
     fn symlink_to_directory_is_followed_once_not_infinitely() {
         let td = TempDir::new().unwrap();
@@ -246,6 +264,7 @@ mod tests {
         assert_eq!(r.files.len(), 1);
     }
 
+    #[cfg(unix)]
     #[test]
     fn symlink_cycle_is_broken() {
         let td = TempDir::new().unwrap();
