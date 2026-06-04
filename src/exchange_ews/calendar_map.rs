@@ -8,7 +8,7 @@ use serde_json::{Map, Value, json};
 
 use crate::exchange_ews::parse::{CalendarItemRaw, RawAttendee, RawOccurrence};
 use crate::exchange_ews::recurrence::to_jscalendar_rule;
-use crate::exchange_ews::tz::windows_to_iana;
+use crate::exchange_ews::tz::resolve_to_iana;
 
 pub struct EventValue {
     pub data: Value,
@@ -73,7 +73,7 @@ pub fn to_jscalendar(raw: &CalendarItemRaw) -> EventValue {
     let iana = raw
         .start_tz
         .as_deref()
-        .map(|tz| windows_to_iana(tz).unwrap_or(tz).to_owned());
+        .map(|tz| resolve_to_iana(tz).unwrap_or_else(|| "Etc/UTC".to_owned()));
     if let Some(true) = raw.is_all_day_event {
         if let Some(start) = raw.start.as_ref() {
             let date_only = start.split('T').next().unwrap_or(start.as_str());
@@ -155,7 +155,7 @@ pub fn to_jscalendar(raw: &CalendarItemRaw) -> EventValue {
     if let Some(rec) = raw.recurrence.as_ref()
         && let Some(rule) = to_jscalendar_rule(rec)
     {
-        event.insert("recurrenceRules".to_owned(), Value::Array(vec![rule]));
+        event.insert("recurrenceRule".to_owned(), rule);
     }
     let overrides = build_recurrence_overrides(
         &raw.modified_occurrences,
@@ -429,7 +429,7 @@ mod tests {
     }
 
     #[test]
-    fn unknown_windows_timezone_passes_through_verbatim() {
+    fn unknown_windows_timezone_falls_back_to_utc() {
         let raw = CalendarItemRaw {
             uid: Some("uid-x".to_owned()),
             start: Some("2025-06-15T14:00:00Z".to_owned()),
@@ -439,7 +439,7 @@ mod tests {
         };
         let v = to_jscalendar(&raw).data;
         assert_eq!(v["start"], "2025-06-15T14:00:00");
-        assert_eq!(v["timeZone"], "Made Up Time");
+        assert_eq!(v["timeZone"], "Etc/UTC");
     }
 
     #[test]
@@ -514,8 +514,9 @@ mod tests {
             ..CalendarItemRaw::default()
         };
         let v = to_jscalendar(&raw).data;
-        assert_eq!(v["recurrenceRules"][0]["frequency"], "daily");
-        assert_eq!(v["recurrenceRules"][0]["count"], 3);
+        assert!(v.get("recurrenceRules").is_none());
+        assert_eq!(v["recurrenceRule"]["frequency"], "daily");
+        assert_eq!(v["recurrenceRule"]["count"], 3);
         let over = v["recurrenceOverrides"].as_object().unwrap();
         assert!(over.contains_key("2025-06-16T14:00:00"));
         assert_eq!(over["2025-06-17T14:00:00"]["excluded"], true);

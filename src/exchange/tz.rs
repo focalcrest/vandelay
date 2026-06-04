@@ -14,6 +14,27 @@ pub fn windows_to_iana(windows_name: &str) -> Option<&'static str> {
     None
 }
 
+pub fn resolve_to_iana(value: &str) -> Option<String> {
+    use calcard::common::timezone::Tz;
+    use std::str::FromStr;
+
+    let key = value.trim();
+    if key.is_empty() {
+        return None;
+    }
+    if let Some(rest) = key.strip_prefix("tzone://Microsoft/") {
+        return rest
+            .eq_ignore_ascii_case("Utc")
+            .then(|| "Etc/UTC".to_owned());
+    }
+    if let Some(iana) = windows_to_iana(key) {
+        return Some(iana.to_owned());
+    }
+    Tz::from_str(key)
+        .ok()
+        .and_then(|tz| tz.name().map(|name| name.into_owned()))
+}
+
 const TABLE: &[(&str, &str)] = &[
     ("UTC", "Etc/UTC"),
     ("Coordinated Universal Time", "Etc/UTC"),
@@ -246,6 +267,26 @@ mod tests {
             windows_to_iana("Aus Central W. Standard Time"),
             Some("Australia/Eucla")
         );
+    }
+
+    #[test]
+    fn resolve_handles_windows_iana_offset_and_microsoft_tzone() {
+        assert_eq!(
+            resolve_to_iana("Romance Standard Time").as_deref(),
+            Some("Europe/Paris")
+        );
+        assert_eq!(
+            resolve_to_iana("Europe/Paris").as_deref(),
+            Some("Europe/Paris")
+        );
+        assert_eq!(resolve_to_iana("UTC").as_deref(), Some("Etc/UTC"));
+        assert_eq!(
+            resolve_to_iana("tzone://Microsoft/Utc").as_deref(),
+            Some("Etc/UTC")
+        );
+        assert_eq!(resolve_to_iana("tzone://Microsoft/Custom"), None);
+        assert_eq!(resolve_to_iana("Made Up Zone"), None);
+        assert_eq!(resolve_to_iana(""), None);
     }
 
     #[test]

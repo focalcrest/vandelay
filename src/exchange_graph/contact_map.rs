@@ -67,7 +67,7 @@ pub fn convert_contact(graph_contact: &Value) -> Result<ConvertedContact, GraphE
     if !components.is_empty() {
         name_object.insert("components".to_owned(), Value::Array(components));
     }
-    if !name_object.is_empty() {
+    if name_object.contains_key("full") || name_object.contains_key("components") {
         card.insert("name".to_owned(), Value::Object(name_object));
     }
 
@@ -139,9 +139,17 @@ pub fn convert_contact(graph_contact: &Value) -> Result<ConvertedContact, GraphE
     }
 
     let mut addresses = Map::new();
-    push_address(&mut addresses, graph_contact.get("homeAddress"), "private");
-    push_address(&mut addresses, graph_contact.get("businessAddress"), "work");
-    push_address(&mut addresses, graph_contact.get("otherAddress"), "other");
+    push_address(
+        &mut addresses,
+        graph_contact.get("homeAddress"),
+        Some("private"),
+    );
+    push_address(
+        &mut addresses,
+        graph_contact.get("businessAddress"),
+        Some("work"),
+    );
+    push_address(&mut addresses, graph_contact.get("otherAddress"), None);
     if !addresses.is_empty() {
         card.insert("addresses".to_owned(), Value::Object(addresses));
     }
@@ -265,35 +273,6 @@ pub fn convert_contact(graph_contact: &Value) -> Result<ConvertedContact, GraphE
         card.insert("anniversaries".to_owned(), Value::Object(anniversaries));
     }
 
-    let mut related = Map::new();
-    if let Some(m) = graph_contact.get("manager").and_then(Value::as_str)
-        && !m.is_empty()
-    {
-        related.insert(
-            m.to_owned(),
-            json!({"@type": "Relation", "relation": {"co-worker": true}}),
-        );
-    }
-    if let Some(s) = graph_contact.get("spouseName").and_then(Value::as_str)
-        && !s.is_empty()
-    {
-        related.insert(
-            s.to_owned(),
-            json!({"@type": "Relation", "relation": {"spouse": true}}),
-        );
-    }
-    if let Some(kids) = graph_contact.get("children").and_then(Value::as_array) {
-        for kid in kids.iter().filter_map(Value::as_str) {
-            related.insert(
-                kid.to_owned(),
-                json!({"@type": "Relation", "relation": {"child": true}}),
-            );
-        }
-    }
-    if !related.is_empty() {
-        card.insert("relatedTo".to_owned(), Value::Object(related));
-    }
-
     if let Some(link) = graph_contact
         .get("businessHomePage")
         .and_then(Value::as_str)
@@ -308,13 +287,19 @@ pub fn convert_contact(graph_contact: &Value) -> Result<ConvertedContact, GraphE
     }
 
     if let Some(created) = graph_contact.get("createdDateTime").and_then(Value::as_str) {
-        card.insert("created".to_owned(), Value::from(created.to_owned()));
+        card.insert(
+            "created".to_owned(),
+            Value::from(normalise_utc_datetime(created)),
+        );
     }
     if let Some(updated) = graph_contact
         .get("lastModifiedDateTime")
         .and_then(Value::as_str)
     {
-        card.insert("updated".to_owned(), Value::from(updated.to_owned()));
+        card.insert(
+            "updated".to_owned(),
+            Value::from(normalise_utc_datetime(updated)),
+        );
     }
 
     Ok(ConvertedContact {
@@ -326,6 +311,20 @@ pub fn convert_contact(graph_contact: &Value) -> Result<ConvertedContact, GraphE
 pub fn synthetic_uid(graph_id: &str) -> String {
     let hash = blake3::hash(graph_id.as_bytes());
     format!("vandelay-graph-{}", hash.to_hex())
+}
+
+fn normalise_utc_datetime(raw: &str) -> String {
+    let trailing_z = raw.ends_with('Z');
+    let trimmed = raw.trim_end_matches('Z');
+    let base = match trimmed.find('.') {
+        Some(dot) => &trimmed[..dot],
+        None => trimmed,
+    };
+    if trailing_z {
+        format!("{base}Z")
+    } else {
+        base.to_owned()
+    }
 }
 
 fn parse_partial_date(raw: &str) -> Option<Value> {
@@ -368,7 +367,7 @@ fn push_phones(target: &mut Map<String, Value>, list: Option<&Vec<Value>>, conte
     }
 }
 
-fn push_address(target: &mut Map<String, Value>, source: Option<&Value>, context: &str) {
+fn push_address(target: &mut Map<String, Value>, source: Option<&Value>, context: Option<&str>) {
     let Some(source) = source else { return };
     let Some(map) = source.as_object() else {
         return;
@@ -396,7 +395,9 @@ fn push_address(target: &mut Map<String, Value>, source: Option<&Value>, context
     }
     let mut address = Map::new();
     address.insert("@type".to_owned(), Value::from("Address"));
-    address.insert("contexts".to_owned(), json!({context: true}));
+    if let Some(context) = context {
+        address.insert("contexts".to_owned(), json!({context: true}));
+    }
     if let Some(s) = street {
         address.insert("full".to_owned(), Value::from(s.to_owned()));
     }
@@ -486,6 +487,15 @@ mod tests {
         let conv = convert_contact(&c).unwrap();
         let addresses = conv.data["addresses"].as_object().unwrap();
         assert_eq!(addresses.len(), 3);
+        let has_other_context = addresses
+            .values()
+            .any(|a| a.get("contexts").and_then(|c| c.get("other")).is_some());
+        assert!(!has_other_context);
+        let without_context = addresses
+            .values()
+            .filter(|a| a.get("contexts").is_none())
+            .count();
+        assert_eq!(without_context, 1);
     }
 
     #[test]
@@ -569,7 +579,7 @@ mod tests {
     }
 
     #[test]
-    fn manager_and_children_become_related_to() {
+    fn related_contacts_are_dropped_without_resolvable_uids() {
         let c = json!({
             "id": "X",
             "manager": "alice@x.com",
@@ -577,10 +587,26 @@ mod tests {
             "children": ["Kid A", "Kid B"]
         });
         let conv = convert_contact(&c).unwrap();
-        let related = conv.data["relatedTo"].as_object().unwrap();
-        assert!(related.contains_key("alice@x.com"));
-        assert!(related.contains_key("Bob"));
-        assert!(related.contains_key("Kid A"));
-        assert!(related.contains_key("Kid B"));
+        assert!(conv.data.get("relatedTo").is_none());
+    }
+
+    #[test]
+    fn nameless_contact_omits_name_object() {
+        let c = json!({"id": "X", "businessPhones": ["+1"]});
+        let conv = convert_contact(&c).unwrap();
+        assert!(conv.data.get("name").is_none());
+    }
+
+    #[test]
+    fn timestamps_strip_fractional_seconds() {
+        let c = json!({
+            "id": "X",
+            "displayName": "Alice",
+            "createdDateTime": "2026-05-01T08:00:00.0000000Z",
+            "lastModifiedDateTime": "2026-05-02T08:00:00.123Z"
+        });
+        let conv = convert_contact(&c).unwrap();
+        assert_eq!(conv.data["created"], "2026-05-01T08:00:00Z");
+        assert_eq!(conv.data["updated"], "2026-05-02T08:00:00Z");
     }
 }

@@ -6,7 +6,7 @@
 
 use serde_json::{Map, Value, json};
 
-use crate::exchange::tz::windows_to_iana;
+use crate::exchange::tz::resolve_to_iana;
 use crate::exchange_graph::error::GraphError;
 use crate::exchange_graph::recurrence::convert_patterned_recurrence_rule;
 
@@ -26,16 +26,21 @@ pub fn graph_calendar_color_to_hex(value: &str) -> Option<&'static str> {
 }
 
 pub fn windows_or_iana_to_iana(value: &str) -> Option<String> {
-    if value.is_empty() {
-        return None;
-    }
-    if let Some(iana) = windows_to_iana(value) {
-        return Some(iana.to_owned());
-    }
-    if value.contains('/') {
-        return Some(value.to_owned());
-    }
-    None
+    resolve_to_iana(value)
+}
+
+fn utc_naive_to_local(utc_naive: &str, iana: &str) -> Option<String> {
+    use chrono::{NaiveDateTime, TimeZone};
+    use chrono_tz::Tz;
+
+    let tz: Tz = iana.parse().ok()?;
+    let naive = NaiveDateTime::parse_from_str(utc_naive, "%Y-%m-%dT%H:%M:%S").ok()?;
+    Some(
+        tz.from_utc_datetime(&naive)
+            .naive_local()
+            .format("%Y-%m-%dT%H:%M:%S")
+            .to_string(),
+    )
 }
 
 #[derive(Debug, Clone)]
@@ -93,7 +98,6 @@ pub fn convert_event(
 
     let mut card = Map::new();
     card.insert("@type".to_owned(), Value::from("Event"));
-    card.insert("version".to_owned(), Value::from("2.0"));
     card.insert("uid".to_owned(), Value::from(uid.clone()));
 
     if let Some(subject) = graph_event.get("subject").and_then(Value::as_str)
@@ -112,17 +116,12 @@ pub fn convert_event(
     let start_dt = extract_local_datetime(graph_event.get("start")).map(strip_fractional);
     let end_dt = extract_local_datetime(graph_event.get("end")).map(strip_fractional);
 
-    if let Some(start) = start_dt.as_deref() {
-        card.insert("start".to_owned(), Value::from(start.to_owned()));
-    }
+    let is_all_day = graph_event
+        .get("isAllDay")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
 
-    if let (Some(start), Some(end)) = (start_dt.as_deref(), end_dt.as_deref())
-        && let Some(dur) = duration_iso8601(start, end)
-    {
-        card.insert("duration".to_owned(), Value::from(dur));
-    }
-
-    let event_tz = graph_event
+    let display_tz = graph_event
         .get("originalStartTimeZone")
         .and_then(Value::as_str)
         .and_then(windows_or_iana_to_iana)
@@ -133,15 +132,28 @@ pub fn convert_event(
                 .and_then(Value::as_str)
                 .and_then(windows_or_iana_to_iana)
         })
-        .or_else(|| fallback_calendar_tz.map(str::to_owned));
-    if let Some(tz) = event_tz {
-        card.insert("timeZone".to_owned(), Value::from(tz));
+        .or_else(|| fallback_calendar_tz.and_then(windows_or_iana_to_iana))
+        .filter(|z| z != "Etc/UTC");
+
+    if let Some(start) = start_dt.as_deref() {
+        let value = match (is_all_day, display_tz.as_deref()) {
+            (false, Some(tz)) => utc_naive_to_local(start, tz).unwrap_or_else(|| start.to_owned()),
+            _ => start.to_owned(),
+        };
+        card.insert("start".to_owned(), Value::from(value));
     }
 
-    if let Some(all_day) = graph_event.get("isAllDay").and_then(Value::as_bool)
-        && all_day
+    if let (Some(start), Some(end)) = (start_dt.as_deref(), end_dt.as_deref())
+        && let Some(dur) = duration_iso8601(start, end)
     {
+        card.insert("duration".to_owned(), Value::from(dur));
+    }
+
+    if is_all_day {
         card.insert("showWithoutTime".to_owned(), Value::Bool(true));
+    } else {
+        let label = display_tz.unwrap_or_else(|| "Etc/UTC".to_owned());
+        card.insert("timeZone".to_owned(), Value::from(label));
     }
 
     if let Some(true) = graph_event.get("isCancelled").and_then(Value::as_bool) {
@@ -559,7 +571,8 @@ mod tests {
         assert!(kws.contains_key("Red"));
         assert!(kws.contains_key("Internal"));
         assert!(conv.data.get("categories").is_none());
-        assert_eq!(conv.data["version"], "2.0");
+        assert!(conv.data.get("version").is_none());
+        assert_eq!(conv.data["timeZone"], "Etc/UTC");
         let alerts = conv.data["alerts"].as_object().unwrap();
         assert_eq!(alerts["alert-1"]["trigger"]["offset"], "-PT15M");
     }
@@ -678,6 +691,58 @@ mod tests {
         v["start"]["timeZone"] = Value::from("UTC");
         let conv = convert_event(&v, None).unwrap();
         assert_eq!(conv.data["timeZone"], "America/Los_Angeles");
+        assert_eq!(conv.data["start"], "2026-05-27T03:00:00");
+    }
+
+    #[test]
+    fn utc_times_are_converted_into_the_original_zone() {
+        let mut v = sample();
+        v["originalStartTimeZone"] = Value::from("Europe/Paris");
+        v["start"]["dateTime"] = Value::from("2025-03-12T07:30:00.0000000");
+        v["start"]["timeZone"] = Value::from("UTC");
+        v["end"]["dateTime"] = Value::from("2025-03-12T08:00:00.0000000");
+        v["end"]["timeZone"] = Value::from("UTC");
+        let conv = convert_event(&v, None).unwrap();
+        assert_eq!(conv.data["start"], "2025-03-12T08:30:00");
+        assert_eq!(conv.data["timeZone"], "Europe/Paris");
+        assert_eq!(conv.data["duration"], "PT30M");
+    }
+
+    #[test]
+    fn summer_event_shifts_by_two_hours_in_paris() {
+        let mut v = sample();
+        v["originalStartTimeZone"] = Value::from("Romance Standard Time");
+        v["start"]["dateTime"] = Value::from("2025-07-15T06:30:00.0000000");
+        v["start"]["timeZone"] = Value::from("UTC");
+        v["end"]["dateTime"] = Value::from("2025-07-15T07:30:00.0000000");
+        v["end"]["timeZone"] = Value::from("UTC");
+        let conv = convert_event(&v, None).unwrap();
+        assert_eq!(conv.data["start"], "2025-07-15T08:30:00");
+        assert_eq!(conv.data["timeZone"], "Europe/Paris");
+    }
+
+    #[test]
+    fn unresolvable_microsoft_zone_falls_back_to_utc() {
+        let mut v = sample();
+        v["originalStartTimeZone"] = Value::from("tzone://Microsoft/Custom");
+        v["start"]["dateTime"] = Value::from("2025-03-12T07:30:00.0000000");
+        v["start"]["timeZone"] = Value::from("UTC");
+        let conv = convert_event(&v, None).unwrap();
+        assert_eq!(conv.data["start"], "2025-03-12T07:30:00");
+        assert_eq!(conv.data["timeZone"], "Etc/UTC");
+    }
+
+    #[test]
+    fn all_day_keeps_date_and_omits_timezone() {
+        let mut v = sample();
+        v["isAllDay"] = Value::Bool(true);
+        v["originalStartTimeZone"] = Value::from("Europe/Paris");
+        v["start"]["dateTime"] = Value::from("2025-03-12T00:00:00.0000000");
+        v["start"]["timeZone"] = Value::from("UTC");
+        let conv = convert_event(&v, None).unwrap();
+        assert_eq!(conv.data["start"], "2025-03-12T00:00:00");
+        assert_eq!(conv.data["showWithoutTime"], true);
+        assert!(conv.data.get("timeZone").is_none());
     }
 
     #[test]

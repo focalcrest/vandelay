@@ -174,34 +174,6 @@ pub fn to_jscontact(raw: &ContactItemRaw) -> Value {
             Value::Object(map_singleton("1", json!({"@type": "Note", "note": notes}))),
         );
     }
-    let mut related: Map<String, Value> = Map::new();
-    if let Some(v) = raw.spouse.as_ref() {
-        related.insert(
-            v.clone(),
-            json!({"@type": "Relation", "relation": {"spouse": true}}),
-        );
-    }
-    for child in &raw.children {
-        related.insert(
-            child.clone(),
-            json!({"@type": "Relation", "relation": {"child": true}}),
-        );
-    }
-    if let Some(v) = raw.manager.as_ref() {
-        related.insert(
-            v.clone(),
-            json!({"@type": "Relation", "relation": {"x-manager": true}}),
-        );
-    }
-    if let Some(v) = raw.assistant.as_ref() {
-        related.insert(
-            v.clone(),
-            json!({"@type": "Relation", "relation": {"x-assistant": true}}),
-        );
-    }
-    if !related.is_empty() {
-        card.insert("relatedTo".to_owned(), Value::Object(related));
-    }
     Value::Object(card)
 }
 
@@ -440,15 +412,16 @@ mod tests {
     }
 
     #[test]
-    fn relations_use_x_prefix_for_manager_and_assistant() {
+    fn unresolvable_relations_are_dropped() {
         let raw = ContactItemRaw {
             display_name: Some("X".to_owned()),
             manager: Some("Boss".to_owned()),
             assistant: Some("Asst".to_owned()),
+            spouse: Some("Partner".to_owned()),
+            children: vec!["Kid".to_owned()],
             ..ContactItemRaw::default()
         };
         let v = to_jscontact(&raw);
-        assert_eq!(v["relatedTo"]["Boss"]["relation"]["x-manager"], true);
-        assert_eq!(v["relatedTo"]["Asst"]["relation"]["x-assistant"], true);
+        assert!(v.get("relatedTo").is_none());
     }
 }
