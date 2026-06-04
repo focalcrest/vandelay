@@ -714,6 +714,105 @@ fn integration_full_run_mail_only_imports_mime_via_value() {
 }
 
 #[test]
+fn integration_duplicate_message_id_does_not_abort_run() {
+    let mut server = Server::new();
+    let _principal = server
+        .mock("GET", Matcher::Regex(r"^/me\?\$select=id".to_owned()))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"id":"uid-1","userPrincipalName":"alice@x.com"}"#)
+        .create();
+    let _folders = server
+        .mock("GET", "/me/mailFolders?$top=100&includeHiddenFolders=true")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"value":[{"id":"FMAIL","displayName":"Inbox","isHidden":false}]}"#)
+        .create();
+    let _children = server
+        .mock(
+            "GET",
+            "/me/mailFolders/FMAIL/childFolders?$top=100&includeHiddenFolders=true",
+        )
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"value":[]}"#)
+        .create();
+    let _well_known: Vec<mockito::Mock> = [
+        "inbox",
+        "drafts",
+        "sentitems",
+        "deleteditems",
+        "junkemail",
+        "archive",
+    ]
+    .iter()
+    .map(|name| {
+        let path = format!("/me/mailFolders/{name}?$select=id");
+        server
+            .mock("GET", path.as_str())
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(if *name == "inbox" {
+                r#"{"id":"FMAIL"}"#
+            } else {
+                r#"{"id":"OTHER"}"#
+            })
+            .create()
+    })
+    .collect();
+    let _ids = server
+        .mock("GET", "/me/mailFolders/FMAIL/messages?$top=100&$select=id")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"value":[{"id":"MSG-1"},{"id":"MSG-1"}]}"#)
+        .create();
+    let mime = "From: a@x\r\nTo: b@x\r\nSubject: hi\r\nDate: Tue, 27 May 2026 10:00:00 +0000\r\nMessage-ID: <abc@x>\r\n\r\nhello";
+    let _value = server
+        .mock("GET", "/me/messages/MSG-1/$value")
+        .match_header("accept", "text/plain")
+        .with_status(200)
+        .with_header("content-type", "text/plain")
+        .with_body(mime)
+        .create();
+
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    let archive_path = tmp.path().to_owned();
+    let common = vandelay::sync::CommonConfig {
+        archive: archive_path.clone(),
+        threads: 2,
+        dry_run: false,
+        max_retries: 0,
+        allow_invalid_certs: false,
+        logger: vandelay::logging::Logger::new(0),
+    };
+    let config = vandelay::sync::import_exchange_graph::GraphImportConfig {
+        auth: vandelay::sync::import_exchange_graph::GraphAuth::PreAcquired {
+            token: make_jwt(9999999999, "alice@x.com"),
+        },
+        api_base: server.url(),
+        user_target: None,
+        mailbox_kind: vandelay::exchange_graph::types::MailboxKind::Primary,
+        objects: Some(vec![
+            vandelay::types::ObjectType::Mailbox,
+            vandelay::types::ObjectType::Email,
+        ]),
+        event_body_format: vandelay::exchange_graph::types::EventBodyFormat::Text,
+        graph_connections: 2,
+        top: 100,
+        allow_source_change: false,
+    };
+    drop(tmp);
+    let summary = vandelay::sync::import_exchange_graph::run(common, config).unwrap();
+    let emails = summary
+        .per_type
+        .iter()
+        .find(|(t, _)| *t == "email")
+        .map(|(_, c)| c.created)
+        .unwrap_or(0);
+    assert_eq!(emails, 1, "expected one email created, got {emails}");
+}
+
+#[test]
 fn integration_full_run_is_convergent_on_second_invocation() {
     let mut server = Server::new();
     let _principal = server

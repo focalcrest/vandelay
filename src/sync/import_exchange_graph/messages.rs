@@ -30,6 +30,7 @@ pub fn reconcile_all(
     let local: std::collections::HashMap<String, i64> =
         exchange_graph_ids::ids_of_type(conn, ctx.source_id, exchange_graph_ids::EMAIL)?;
     let mut server_total: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut planned: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut any_failure = false;
 
     for folder in folders {
@@ -58,7 +59,7 @@ pub fn reconcile_all(
         }
         let new_ids: Vec<String> = ids
             .into_iter()
-            .filter(|id| !local.contains_key(id))
+            .filter(|id| !local.contains_key(id) && planned.insert(id.clone()))
             .collect();
         if new_ids.is_empty() {
             continue;

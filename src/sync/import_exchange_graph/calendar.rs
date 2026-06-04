@@ -33,6 +33,7 @@ pub fn reconcile_all(
     let local: HashMap<String, i64> =
         exchange_graph_ids::ids_of_type(conn, ctx.source_id, exchange_graph_ids::CALENDAR_EVENT)?;
     let mut server_total: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut planned: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut any_failure = false;
 
     for cal in calendars {
@@ -55,7 +56,7 @@ pub fn reconcile_all(
                 _ => {
                     if let Some(id) = stub.get("id").and_then(Value::as_str) {
                         server_total.insert(id.to_owned());
-                        if !local.contains_key(id) {
+                        if !local.contains_key(id) && planned.insert(id.to_owned()) {
                             want_ids.push(id.to_owned());
                         }
                     }
