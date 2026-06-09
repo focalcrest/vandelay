@@ -926,6 +926,38 @@ fn coordinator_special_use_drives_role() {
 }
 
 #[test]
+fn coordinator_omits_special_use_when_unadvertised() {
+    let control: Script = Box::new(|conn: &mut MockConn| -> std::io::Result<()> {
+        auth_preamble(conn, "IMAP4rev2 LIST-EXTENDED LIST-STATUS LITERAL+ AUTH=PLAIN")?;
+        let (tag, cmd) = conn.read_command()?;
+        if cmd.contains("SPECIAL-USE") {
+            conn.write_line(&format!(
+                "{tag} BAD parse error: unknown LIST return option \"SPECIAL-USE\""
+            ))?;
+            return Ok(());
+        }
+        assert!(
+            cmd.contains("RETURN (SUBSCRIBED CHILDREN STATUS (UIDVALIDITY UIDNEXT MESSAGES))"),
+            "expected LIST-STATUS form without SPECIAL-USE, got {cmd}"
+        );
+        conn.write_line("* LIST () \"/\" \"INBOX\"")?;
+        conn.write_line("* STATUS \"INBOX\" (UIDVALIDITY 100 UIDNEXT 1 MESSAGES 0)")?;
+        conn.write_line(&format!("{tag} OK"))?;
+        drain_until_close(conn);
+        Ok(())
+    });
+    let server = MockImap::start_scripts(vec![
+        control,
+        worker_idle_script("IMAP4rev2 LIST-EXTENDED LIST-STATUS LITERAL+"),
+    ]);
+    let archive = tempfile("nospecialuse");
+    run_import(&server, "alice", archive.clone(), |_| {})
+        .expect("import must not send unadvertised SPECIAL-USE");
+    let conn = Connection::open(&archive).unwrap();
+    assert_eq!(folder_role(&conn, "INBOX"), Some("inbox".to_owned()));
+}
+
+#[test]
 fn coordinator_skips_deleted_messages_by_default() {
     let control = control_script_one_folder(100, 3, &[1, 2]);
     let worker: Script = Box::new(|conn: &mut MockConn| -> std::io::Result<()> {
@@ -1155,7 +1187,7 @@ fn coordinator_uses_list_status_to_skip_empty_folder_select() {
     let control: Script = Box::new(|conn: &mut MockConn| -> std::io::Result<()> {
         auth_preamble(
             conn,
-            "IMAP4rev2 LITERAL+ LIST-EXTENDED LIST-STATUS AUTH=PLAIN",
+            "IMAP4rev2 LITERAL+ LIST-EXTENDED LIST-STATUS SPECIAL-USE AUTH=PLAIN",
         )?;
         let (tag, cmd) = conn.read_command()?;
         assert!(

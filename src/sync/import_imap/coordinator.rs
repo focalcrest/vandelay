@@ -299,21 +299,19 @@ pub fn run(common: CommonConfig, config: ImapImportConfig) -> Result<Summary, Er
     let namespace_prefix = discover_namespace(&mut client, logger)?;
 
     let extended_supported = client.has_capability("LIST-EXTENDED");
+    let special_use_supported = client.has_capability("SPECIAL-USE");
     let list_status_supported = extended_supported && client.has_capability("LIST-STATUS");
-    let list_cmd = if list_status_supported {
-        command::list_extended(
-            "",
-            &["*"],
-            &[],
-            &[
-                "SPECIAL-USE",
-                "SUBSCRIBED",
-                "CHILDREN",
-                "STATUS (UIDVALIDITY UIDNEXT MESSAGES)",
-            ],
-        )
-    } else if extended_supported {
-        command::list_extended("", &["*"], &[], &["SPECIAL-USE", "SUBSCRIBED"])
+    let list_cmd = if extended_supported {
+        let mut return_opts: Vec<&str> = Vec::new();
+        if special_use_supported {
+            return_opts.push("SPECIAL-USE");
+        }
+        return_opts.push("SUBSCRIBED");
+        if list_status_supported {
+            return_opts.push("CHILDREN");
+            return_opts.push("STATUS (UIDVALIDITY UIDNEXT MESSAGES)");
+        }
+        command::list_extended("", &["*"], &[], &return_opts)
     } else {
         command::list("", "*")
     };
