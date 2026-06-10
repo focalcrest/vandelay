@@ -18,7 +18,7 @@ use crate::sync::TypeCounts;
 use super::attachments::fetch_contact_photo;
 use super::folders::FolderPlan;
 use super::items::{
-    EnumerationMode, ItemRunCtx, delete_vanished, enumerate_folder, get_items, plan_for,
+    EnumerationMode, ItemRunCtx, delete_vanished, enumerate_folder, for_each_fetched_item, plan_for,
 };
 
 pub fn reconcile_all(
@@ -40,9 +40,18 @@ pub fn reconcile_all(
             Some(id) => id,
             None => continue,
         };
-        if let Err(e) = reconcile_one(conn, ctx, folder_id, local_folder_id, counts) {
-            ctx.logger
-                .warn(&format!("contact folder {} failed: {}", folder_id.id, e));
+        if let Err(e) = reconcile_one(
+            conn,
+            ctx,
+            folder_id,
+            &folder.folder.display_name,
+            local_folder_id,
+            counts,
+        ) {
+            ctx.logger.warn(&format!(
+                "contact folder {:?} failed: {}",
+                folder.folder.display_name, e
+            ));
             counts.failed += 1;
         }
     }
@@ -53,6 +62,7 @@ fn reconcile_one(
     conn: &mut Connection,
     ctx: &ItemRunCtx<'_>,
     folder: &crate::exchange_ews::types::FolderId,
+    folder_name: &str,
     local_folder_id: i64,
     counts: &mut TypeCounts,
 ) -> Result<(), Error> {
@@ -74,8 +84,8 @@ fn reconcile_one(
     let plan = plan_for(&outcome, &local);
     if ctx.logger.enabled(LEVEL_PROGRESS) {
         eprintln!(
-            "EWS contacts folder {}: new={} changed={} vanished={}",
-            folder.id,
+            "EWS contacts folder {:?}: new={} changed={} vanished={}",
+            folder_name,
             plan.new.len(),
             plan.present_changed.len(),
             plan.vanished.len()
@@ -86,9 +96,7 @@ fn reconcile_one(
         to_fetch.push(id.clone());
     }
     if !to_fetch.is_empty() {
-        let outcome = get_items(ctx, ItemShape::Contact, &to_fetch).map_err(Error::from)?;
-        counts.failed += outcome.failed_items;
-        for msg in outcome.messages {
+        let failed_items = for_each_fetched_item(ctx, ItemShape::Contact, &to_fetch, |msg| {
             if !msg.success {
                 if matches!(
                     msg.response_code,
@@ -100,12 +108,12 @@ fn reconcile_one(
                     ctx.logger
                         .warn(&format!("GetItem (contact) error: {}", msg.response_code));
                 }
-                continue;
+                return Ok(());
             }
             let parsed = parse_contact_item(&msg.inner_xml).map_err(Error::from)?;
             if parsed.id.id.is_empty() {
                 counts.failed += 1;
-                continue;
+                return Ok(());
             }
             let existing = plan
                 .present_changed
@@ -120,8 +128,9 @@ fn reconcile_one(
                 &folder.id,
                 existing,
                 counts,
-            )?;
-        }
+            )
+        })?;
+        counts.failed += failed_items;
     }
     delete_vanished(
         conn,

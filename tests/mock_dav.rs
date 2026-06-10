@@ -333,6 +333,33 @@ fn http_503_retries_then_succeeds() {
 }
 
 #[test]
+fn xml_entities_decoded_in_displayname_and_calendar_data() {
+    let body = r#"<?xml version="1.0"?>
+<d:multistatus xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">
+  <d:response>
+    <d:href>/cal/1.ics</d:href>
+    <d:propstat><d:prop>
+      <d:displayname>Sales &amp; Marketing &lt;Team&gt;</d:displayname>
+      <c:calendar-data>BEGIN:VEVENT
+SUMMARY:Q&amp;A &amp; review
+END:VEVENT</c:calendar-data>
+    </d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat>
+  </d:response>
+</d:multistatus>"#;
+    let r = parse_multistatus(Cursor::new(body), "https://x/").expect("parse");
+    assert_eq!(r.len(), 1);
+    assert_eq!(
+        r[0].props.displayname.as_deref(),
+        Some("Sales & Marketing <Team>")
+    );
+    let cal = r[0].props.calendar_data.as_deref().unwrap();
+    assert!(
+        cal.contains("SUMMARY:Q&A & review"),
+        "calendar-data entities must be decoded: {cal}"
+    );
+}
+
+#[test]
 fn duplicate_response_hrefs_collapsed_on_parse() {
     let body = r#"<?xml version="1.0"?>
 <d:multistatus xmlns:d="DAV:">

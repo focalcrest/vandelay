@@ -368,6 +368,29 @@ pub fn get_items(
     })
 }
 
+pub fn for_each_fetched_item<F>(
+    ctx: &ItemRunCtx<'_>,
+    shape: ItemShape,
+    ids: &[ItemId],
+    mut on_message: F,
+) -> Result<u64, Error>
+where
+    F: FnMut(crate::exchange_ews::parse::ResponseMessage) -> Result<(), Error>,
+{
+    let batch = ctx.batch_size.max(1);
+    let workers = ctx.connections.clamp(1, 8);
+    let window = batch.saturating_mul(workers).max(batch);
+    let mut failed_items = 0u64;
+    for win in ids.chunks(window) {
+        let outcome = get_items(ctx, shape, win).map_err(Error::from)?;
+        failed_items = failed_items.saturating_add(outcome.failed_items);
+        for msg in outcome.messages {
+            on_message(msg)?;
+        }
+    }
+    Ok(failed_items)
+}
+
 pub fn delete_vanished(
     conn: &mut rusqlite::Connection,
     source_id: i64,

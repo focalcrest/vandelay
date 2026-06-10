@@ -8,7 +8,7 @@ use std::io::BufRead;
 
 use quick_xml::NsReader;
 use quick_xml::XmlVersion;
-use quick_xml::events::{BytesStart, Event};
+use quick_xml::events::{BytesRef, BytesStart, Event};
 use quick_xml::name::ResolveResult;
 
 use crate::exchange_ews::error::EwsError;
@@ -211,7 +211,7 @@ fn parse_fault<R: BufRead>(xml: &mut NsReader<R>) -> Result<SoapFault, EwsError>
                 let text = t.decode().map(|c| c.into_owned()).unwrap_or_default();
                 match text_target {
                     Some("faultcode") => fault_code = text,
-                    Some("faultstring") => fault_string = text,
+                    Some("faultstring") => fault_string.push_str(&text),
                     Some("responseCode") => code = ResponseCode::parse(&text),
                     Some("messageXmlValue")
                         if last_value_name.as_deref() == Some("BackOffMilliseconds") =>
@@ -222,7 +222,12 @@ fn parse_fault<R: BufRead>(xml: &mut NsReader<R>) -> Result<SoapFault, EwsError>
                 }
             }
             Event::CData(c) if text_target == Some("faultstring") => {
-                fault_string = String::from_utf8_lossy(c.as_ref()).into_owned();
+                fault_string.push_str(&String::from_utf8_lossy(c.as_ref()));
+            }
+            Event::GeneralRef(ref g) if text_target == Some("faultstring") => {
+                if let Some(c) = entity_to_char(g) {
+                    fault_string.push(c);
+                }
             }
             Event::Eof => break,
             _ => {}
@@ -395,6 +400,7 @@ fn parse_folder_element<R: BufRead>(
     xml: &mut NsReader<R>,
     element: FolderElement,
 ) -> Result<FolderEntry, EwsError> {
+    xml.config_mut().trim_text(false);
     let mut entry = FolderEntry {
         element,
         ..FolderEntry::default()
@@ -402,6 +408,7 @@ fn parse_folder_element<R: BufRead>(
     let mut buf = Vec::new();
     let mut depth: u32 = 1;
     let mut current: Option<&'static str> = None;
+    let mut cur = String::new();
     loop {
         buf.clear();
         let (ns, ev) = xml.read_resolved_event_into(&mut buf)?;
@@ -429,12 +436,16 @@ fn parse_folder_element<R: BufRead>(
                         }
                     } else if local.eq_ignore_ascii_case(b"DisplayName") {
                         current = Some("displayName");
+                        cur.clear();
                     } else if local.eq_ignore_ascii_case(b"FolderClass") {
                         current = Some("folderClass");
+                        cur.clear();
                     } else if local.eq_ignore_ascii_case(b"TotalCount") {
                         current = Some("totalCount");
+                        cur.clear();
                     } else if local.eq_ignore_ascii_case(b"ChildFolderCount") {
                         current = Some("childCount");
+                        cur.clear();
                     } else {
                         current = None;
                     }
@@ -444,23 +455,33 @@ fn parse_folder_element<R: BufRead>(
                 }
             }
             Event::End(_) => {
+                if let Some(field) = current.take() {
+                    let text = std::mem::take(&mut cur);
+                    match field {
+                        "displayName" => entry.display_name = text.trim().to_owned(),
+                        "folderClass" => entry.folder_class = text.trim().to_owned(),
+                        "totalCount" => entry.total_count = text.trim().parse().ok(),
+                        "childCount" => entry.child_count = text.trim().parse().ok(),
+                        _ => {}
+                    }
+                }
                 if depth == 0 {
                     break;
                 }
                 depth -= 1;
-                current = None;
                 if depth == 0 {
                     break;
                 }
             }
             Event::Text(t) => {
-                let text = t.decode().map(|c| c.into_owned()).unwrap_or_default();
-                match current {
-                    Some("displayName") => entry.display_name = text,
-                    Some("folderClass") => entry.folder_class = text,
-                    Some("totalCount") => entry.total_count = text.trim().parse().ok(),
-                    Some("childCount") => entry.child_count = text.trim().parse().ok(),
-                    _ => {}
+                cur.push_str(&t.decode().map(|c| c.into_owned()).unwrap_or_default());
+            }
+            Event::CData(c) => {
+                cur.push_str(&String::from_utf8_lossy(c.as_ref()));
+            }
+            Event::GeneralRef(ref g) => {
+                if let Some(c) = entity_to_char(g) {
+                    cur.push(c);
                 }
             }
             Event::Eof => break,
@@ -530,12 +551,27 @@ pub fn parse_find_item_response(body: &[u8]) -> Result<FindItemResponse, EwsErro
     Ok(out)
 }
 
+pub(crate) fn entity_to_char(g: &BytesRef) -> Option<char> {
+    if let Ok(Some(c)) = g.resolve_char_ref() {
+        return Some(c);
+    }
+    match g.decode().ok()?.as_ref() {
+        "amp" => Some('&'),
+        "lt" => Some('<'),
+        "gt" => Some('>'),
+        "quot" => Some('"'),
+        "apos" => Some('\''),
+        _ => None,
+    }
+}
+
 fn is_item_element(local: &[u8]) -> bool {
     matches!(
         local.to_ascii_lowercase().as_slice(),
         b"message"
             | b"calendaritem"
             | b"contact"
+            | b"distributionlist"
             | b"meetingrequest"
             | b"meetingresponse"
             | b"meetingmessage"
@@ -662,6 +698,15 @@ fn parse_one_response_message<R: BufRead>(
                 let text = String::from_utf8_lossy(c.as_ref()).into_owned();
                 if in_capture {
                     write_text_xml(&mut inner, &text);
+                }
+            }
+            Event::GeneralRef(ref g) => {
+                if in_capture {
+                    inner.push('&');
+                    if let Ok(name) = g.decode() {
+                        inner.push_str(&name);
+                    }
+                    inner.push(';');
                 }
             }
             Event::Eof => break,
@@ -911,6 +956,7 @@ pub fn parse_message_item(inner_xml: &str) -> Result<MessageItem, EwsError> {
     let mut mime_charset: Option<String> = None;
     let mut category_collecting = false;
     let mut in_flag = false;
+    let mut cur = String::new();
     loop {
         buf.clear();
         let (ns, ev) = xml.read_resolved_event_into(&mut buf)?;
@@ -922,6 +968,7 @@ pub fn parse_message_item(inner_xml: &str) -> Result<MessageItem, EwsError> {
                 if item.element.is_empty() && is_item_element(&local) {
                     item.element = String::from_utf8_lossy(&local).into_owned();
                 } else if ns_kind == Ns::Types {
+                    cur.clear();
                     if local.eq_ignore_ascii_case(b"ItemId") {
                         capture_id_attrs(e, &mut item.id.id, &mut item.id.change_key);
                     } else if local.eq_ignore_ascii_case(b"ParentFolderId") {
@@ -963,41 +1010,42 @@ pub fn parse_message_item(inner_xml: &str) -> Result<MessageItem, EwsError> {
             Event::End(e) => {
                 let local = e.local_name().as_ref().to_vec();
                 let lower = local.to_ascii_lowercase();
+                if let Some(field) = current.take() {
+                    let text = std::mem::take(&mut cur);
+                    match field {
+                        "mimeContent" => {
+                            item.mime_content = Some(text);
+                            item.mime_charset = mime_charset.clone();
+                        }
+                        "subject" => item.subject = Some(text),
+                        "received" => item.date_time_received = Some(text),
+                        "isRead" => item.is_read = Some(matches!(text.trim(), "true" | "1")),
+                        "isDraft" => item.is_draft = Some(matches!(text.trim(), "true" | "1")),
+                        "readReceipt" => {
+                            item.is_read_receipt_requested =
+                                Some(matches!(text.trim(), "true" | "1"));
+                        }
+                        "category" => item.categories.push(text),
+                        "flagStatus" => item.flag_status = Some(text),
+                        _ => {}
+                    }
+                }
+                cur.clear();
                 if lower == b"categories" {
                     category_collecting = false;
                 } else if lower == b"flag" {
                     in_flag = false;
                 }
-                current = None;
             }
-            Event::Text(t) => {
-                let text = t.decode().map(|c| c.into_owned()).unwrap_or_default();
-                match current {
-                    Some("mimeContent") => {
-                        item.mime_content
-                            .get_or_insert_with(String::new)
-                            .push_str(&text);
-                        item.mime_charset = mime_charset.clone();
-                    }
-                    Some("subject") => item.subject = Some(text),
-                    Some("received") => item.date_time_received = Some(text),
-                    Some("isRead") => item.is_read = Some(matches!(text.trim(), "true" | "1")),
-                    Some("isDraft") => item.is_draft = Some(matches!(text.trim(), "true" | "1")),
-                    Some("readReceipt") => {
-                        item.is_read_receipt_requested = Some(matches!(text.trim(), "true" | "1"));
-                    }
-                    Some("category") => item.categories.push(text),
-                    Some("flagStatus") => item.flag_status = Some(text),
-                    _ => {}
-                }
+            Event::Text(ref t) => {
+                cur.push_str(&t.decode().map(|c| c.into_owned()).unwrap_or_default());
             }
-            Event::CData(c) => {
-                let text = String::from_utf8_lossy(c.as_ref()).into_owned();
-                if current == Some("mimeContent") {
-                    item.mime_content
-                        .get_or_insert_with(String::new)
-                        .push_str(&text);
-                    item.mime_charset = mime_charset.clone();
+            Event::CData(ref c) => {
+                cur.push_str(&String::from_utf8_lossy(c.as_ref()));
+            }
+            Event::GeneralRef(ref g) => {
+                if let Some(c) = entity_to_char(g) {
+                    cur.push(c);
                 }
             }
             Event::Eof => break,
@@ -1139,6 +1187,7 @@ pub fn parse_calendar_item(inner_xml: &str) -> Result<CalendarItemRaw, EwsError>
     let mut recurrence_text: Option<&'static str> = None;
     let mut recurrence = RawRecurrence::default();
     let mut pending = PendingRecurrence::default();
+    let mut cur = String::new();
 
     loop {
         buf.clear();
@@ -1200,6 +1249,7 @@ pub fn parse_calendar_item(inner_xml: &str) -> Result<CalendarItemRaw, EwsError>
                     }
                     continue;
                 }
+                cur.clear();
                 if local.eq_ignore_ascii_case(b"ItemId") {
                     if in_modified {
                         if let Some(occ) = occurrence_stack.last_mut() {
@@ -1350,6 +1400,80 @@ pub fn parse_calendar_item(inner_xml: &str) -> Result<CalendarItemRaw, EwsError>
                     recurrence_text = None;
                     continue;
                 }
+                if let Some(tt) = text_target {
+                    let text = std::mem::take(&mut cur);
+                    match tt {
+                        "uid" => item.uid = Some(text),
+                        "subject" => item.subject = Some(text),
+                        "start" => item.start = Some(text),
+                        "end" => item.end = Some(text),
+                        "originalStart" => item.original_start = Some(text),
+                        "isAllDay" => {
+                            item.is_all_day_event = Some(matches!(text.trim(), "true" | "1"));
+                        }
+                        "freeBusy" => item.legacy_free_busy_status = Some(text),
+                        "location" => item.location = Some(text),
+                        "calendarItemType" => {
+                            item.calendar_item_type = CalendarItemType::parse(text.trim());
+                        }
+                        "recurrenceId" => item.recurrence_id = Some(text),
+                        "organizerName" => item.organizer_name = Some(text),
+                        "organizerEmail" => item.organizer_smtp = Some(text),
+                        "attendeeName" => {
+                            if let Some(att) = current_attendee.as_mut() {
+                                att.name = Some(text);
+                            }
+                        }
+                        "attendeeEmail" => {
+                            if let Some(att) = current_attendee.as_mut() {
+                                att.email = Some(text);
+                            }
+                        }
+                        "attendeeResponse" => {
+                            if let Some(att) = current_attendee.as_mut() {
+                                att.response_type = Some(text);
+                            }
+                        }
+                        "reminderIsSet" => {
+                            item.reminder_is_set = Some(matches!(text.trim(), "true" | "1"));
+                        }
+                        "reminderMinutes" => {
+                            item.reminder_minutes_before_start = text.trim().parse().ok();
+                        }
+                        "isOnlineMeeting" => {
+                            item.is_online_meeting = Some(matches!(text.trim(), "true" | "1"));
+                        }
+                        "joinUrl" => item.join_online_meeting_url = Some(text),
+                        "netShowUrl" => item.net_show_url = Some(text),
+                        "workspaceUrl" => item.meeting_workspace_url = Some(text),
+                        "category" => item.categories.push(text),
+                        "created" => item.created = Some(text),
+                        "lastModified" => item.last_modified = Some(text),
+                        "bodyText" => item.body_text = Some(text),
+                        "bodyHtml" => item.body_html = Some(text),
+                        "occStart" => {
+                            if let Some(occ) = occurrence_stack.last_mut() {
+                                occ.start = Some(text.clone());
+                            }
+                            if let Some(occ) = deleted_stack.last_mut() {
+                                occ.start = Some(text);
+                            }
+                        }
+                        "occEnd" => {
+                            if let Some(occ) = occurrence_stack.last_mut() {
+                                occ.end = Some(text);
+                            }
+                        }
+                        "occOrig" => {
+                            if let Some(occ) = occurrence_stack.last_mut() {
+                                occ.original_start = Some(text);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                cur.clear();
+                text_target = None;
                 match lower.as_slice() {
                     b"modifiedoccurrences" => in_modified = false,
                     b"deletedoccurrences" => in_deleted = false,
@@ -1381,14 +1505,9 @@ pub fn parse_calendar_item(inner_xml: &str) -> Result<CalendarItemRaw, EwsError>
                     b"categories" => category_collecting = false,
                     _ => {}
                 }
-                text_target = None;
             }
-            Event::Text(_) | Event::CData(_) => {
-                let text = match ev {
-                    Event::Text(ref t) => t.decode().map(|c| c.into_owned()).unwrap_or_default(),
-                    Event::CData(ref c) => String::from_utf8_lossy(c.as_ref()).into_owned(),
-                    _ => unreachable!(),
-                };
+            Event::Text(ref t) => {
+                let text = t.decode().map(|c| c.into_owned()).unwrap_or_default();
                 if !recurrence_path.is_empty() {
                     match recurrence_text {
                         Some("interval") => pending.interval = text.trim().parse().unwrap_or(1),
@@ -1411,86 +1530,20 @@ pub fn parse_calendar_item(inner_xml: &str) -> Result<CalendarItemRaw, EwsError>
                         }
                         _ => {}
                     }
-
-                    continue;
+                } else {
+                    cur.push_str(&text);
                 }
-
-                match text_target {
-                    Some("uid") => item.uid = Some(text),
-                    Some("subject") => item.subject = Some(text),
-                    Some("start") => item.start = Some(text),
-                    Some("end") => item.end = Some(text),
-                    Some("originalStart") => item.original_start = Some(text),
-                    Some("isAllDay") => {
-                        item.is_all_day_event = Some(matches!(text.trim(), "true" | "1"));
-                    }
-                    Some("freeBusy") => item.legacy_free_busy_status = Some(text),
-                    Some("location") => item.location = Some(text),
-                    Some("calendarItemType") => {
-                        item.calendar_item_type = CalendarItemType::parse(text.trim());
-                    }
-                    Some("recurrenceId") => item.recurrence_id = Some(text),
-                    Some("organizerName") => item.organizer_name = Some(text),
-                    Some("organizerEmail") => item.organizer_smtp = Some(text),
-                    Some("attendeeName") => {
-                        if let Some(att) = current_attendee.as_mut() {
-                            att.name = Some(text);
-                        }
-                    }
-                    Some("attendeeEmail") => {
-                        if let Some(att) = current_attendee.as_mut() {
-                            att.email = Some(text);
-                        }
-                    }
-                    Some("attendeeResponse") => {
-                        if let Some(att) = current_attendee.as_mut() {
-                            att.response_type = Some(text);
-                        }
-                    }
-                    Some("reminderIsSet") => {
-                        item.reminder_is_set = Some(matches!(text.trim(), "true" | "1"));
-                    }
-                    Some("reminderMinutes") => {
-                        item.reminder_minutes_before_start = text.trim().parse().ok();
-                    }
-                    Some("isOnlineMeeting") => {
-                        item.is_online_meeting = Some(matches!(text.trim(), "true" | "1"));
-                    }
-                    Some("joinUrl") => item.join_online_meeting_url = Some(text),
-                    Some("netShowUrl") => item.net_show_url = Some(text),
-                    Some("workspaceUrl") => item.meeting_workspace_url = Some(text),
-                    Some("category") => item.categories.push(text),
-                    Some("created") => item.created = Some(text),
-                    Some("lastModified") => item.last_modified = Some(text),
-                    Some("bodyText") => {
-                        item.body_text
-                            .get_or_insert_with(String::new)
-                            .push_str(&text);
-                    }
-                    Some("bodyHtml") => {
-                        item.body_html
-                            .get_or_insert_with(String::new)
-                            .push_str(&text);
-                    }
-                    Some("occStart") => {
-                        if let Some(occ) = occurrence_stack.last_mut() {
-                            occ.start = Some(text.clone());
-                        }
-                        if let Some(occ) = deleted_stack.last_mut() {
-                            occ.start = Some(text);
-                        }
-                    }
-                    Some("occEnd") => {
-                        if let Some(occ) = occurrence_stack.last_mut() {
-                            occ.end = Some(text);
-                        }
-                    }
-                    Some("occOrig") => {
-                        if let Some(occ) = occurrence_stack.last_mut() {
-                            occ.original_start = Some(text);
-                        }
-                    }
-                    _ => {}
+            }
+            Event::CData(ref c) => {
+                if recurrence_path.is_empty() {
+                    cur.push_str(&String::from_utf8_lossy(c.as_ref()));
+                }
+            }
+            Event::GeneralRef(ref g) => {
+                if recurrence_path.is_empty()
+                    && let Some(c) = entity_to_char(g)
+                {
+                    cur.push(c);
                 }
             }
             Event::Eof => break,
@@ -1631,6 +1684,7 @@ pub fn parse_contact_item(inner_xml: &str) -> Result<ContactItemRaw, EwsError> {
     let mut in_members = false;
     let mut member_mailbox = false;
     let mut current_member: Option<RawGroupMember> = None;
+    let mut cur = String::new();
     loop {
         buf.clear();
         let (ns, ev) = xml.read_resolved_event_into(&mut buf)?;
@@ -1652,6 +1706,7 @@ pub fn parse_contact_item(inner_xml: &str) -> Result<ContactItemRaw, EwsError> {
                 if ns_kind != Ns::Types {
                     continue;
                 }
+                cur.clear();
                 if local.eq_ignore_ascii_case(b"ItemId") {
                     capture_id_attrs(e, &mut item.id.id, &mut item.id.change_key);
                 } else if local.eq_ignore_ascii_case(b"ParentFolderId") {
@@ -1775,6 +1830,71 @@ pub fn parse_contact_item(inner_xml: &str) -> Result<ContactItemRaw, EwsError> {
             Event::End(e) => {
                 let local = e.local_name().as_ref().to_vec();
                 let lower = local.to_ascii_lowercase();
+                if let Some(at) = address_text {
+                    if let Some(addr) = current_address.as_mut() {
+                        let text = std::mem::take(&mut cur);
+                        match at {
+                            "street" => addr.street = Some(text),
+                            "city" => addr.city = Some(text),
+                            "state" => addr.state = Some(text),
+                            "country" => addr.country = Some(text),
+                            "postal" => addr.postal_code = Some(text),
+                            _ => {}
+                        }
+                    }
+                } else if let Some(tt) = text_target {
+                    let text = std::mem::take(&mut cur);
+                    match tt {
+                        "displayName" => item.display_name = Some(text),
+                        "givenName" => item.given_name = Some(text),
+                        "middleName" => item.middle_name = Some(text),
+                        "surname" => item.surname = Some(text),
+                        "initials" => item.initials = Some(text),
+                        "nickname" => item.nickname = Some(text),
+                        "companyName" => item.company_name = Some(text),
+                        "department" => item.department = Some(text),
+                        "jobTitle" => item.job_title = Some(text),
+                        "generation" => item.generation = Some(text),
+                        "officeLocation" => item.office_location = Some(text),
+                        "url" => item.url = Some(text),
+                        "birthday" => item.birthday = Some(text),
+                        "weddingAnniversary" => item.wedding_anniversary = Some(text),
+                        "manager" => item.manager = Some(text),
+                        "spouse" => item.spouse = Some(text),
+                        "assistant" => item.assistant = Some(text),
+                        "profession" => item.profession = Some(text),
+                        "postalAddressIndex" => item.postal_address_index = Some(text),
+                        "notes" => item.notes = Some(text),
+                        "created" => item.created = Some(text),
+                        "lastModified" => item.last_modified = Some(text),
+                        "memberName" => {
+                            if let Some(m) = current_member.as_mut() {
+                                m.name = Some(text);
+                            }
+                        }
+                        "memberEmail" => {
+                            if let Some(m) = current_member.as_mut() {
+                                m.email = Some(text);
+                            }
+                        }
+                        "category" => item.categories.push(text),
+                        "child" => item.children.push(text),
+                        "company" => item.companies.push(text),
+                        "entryValue" => {
+                            let key = entry_key.clone().unwrap_or_default();
+                            match entry_container {
+                                Some("email") => item.emails.push((key, text)),
+                                Some("phone") => item.phones.push((key, text)),
+                                Some("im") => item.ims.push((key, text)),
+                                _ => {}
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                cur.clear();
+                text_target = None;
+                address_text = None;
                 match lower.as_slice() {
                     b"categories" => category_collecting = false,
                     b"children" => children_collecting = false,
@@ -1788,9 +1908,6 @@ pub fn parse_contact_item(inner_xml: &str) -> Result<ContactItemRaw, EwsError> {
                         }
                         entry_key = None;
                     }
-                    b"street" | b"city" | b"state" | b"countryorregion" | b"postalcode" => {
-                        address_text = None;
-                    }
                     b"members" => in_members = false,
                     b"mailbox" => member_mailbox = false,
                     b"member" => {
@@ -1802,74 +1919,16 @@ pub fn parse_contact_item(inner_xml: &str) -> Result<ContactItemRaw, EwsError> {
                     }
                     _ => {}
                 }
-                text_target = None;
             }
-            Event::Text(_) | Event::CData(_) => {
-                let text = match ev {
-                    Event::Text(ref t) => t.decode().map(|c| c.into_owned()).unwrap_or_default(),
-                    Event::CData(ref c) => String::from_utf8_lossy(c.as_ref()).into_owned(),
-                    _ => unreachable!(),
-                };
-
-                if let Some(at) = address_text
-                    && let Some(addr) = current_address.as_mut()
-                {
-                    match at {
-                        "street" => addr.street = Some(text.clone()),
-                        "city" => addr.city = Some(text.clone()),
-                        "state" => addr.state = Some(text.clone()),
-                        "country" => addr.country = Some(text.clone()),
-                        "postal" => addr.postal_code = Some(text.clone()),
-                        _ => {}
-                    }
-                    continue;
-                }
-                match text_target {
-                    Some("displayName") => item.display_name = Some(text),
-                    Some("givenName") => item.given_name = Some(text),
-                    Some("middleName") => item.middle_name = Some(text),
-                    Some("surname") => item.surname = Some(text),
-                    Some("initials") => item.initials = Some(text),
-                    Some("nickname") => item.nickname = Some(text),
-                    Some("companyName") => item.company_name = Some(text),
-                    Some("department") => item.department = Some(text),
-                    Some("jobTitle") => item.job_title = Some(text),
-                    Some("generation") => item.generation = Some(text),
-                    Some("officeLocation") => item.office_location = Some(text),
-                    Some("url") => item.url = Some(text),
-                    Some("birthday") => item.birthday = Some(text),
-                    Some("weddingAnniversary") => item.wedding_anniversary = Some(text),
-                    Some("manager") => item.manager = Some(text),
-                    Some("spouse") => item.spouse = Some(text),
-                    Some("assistant") => item.assistant = Some(text),
-                    Some("profession") => item.profession = Some(text),
-                    Some("postalAddressIndex") => item.postal_address_index = Some(text),
-                    Some("notes") => item.notes = Some(text),
-                    Some("created") => item.created = Some(text),
-                    Some("lastModified") => item.last_modified = Some(text),
-                    Some("memberName") => {
-                        if let Some(m) = current_member.as_mut() {
-                            m.name = Some(text);
-                        }
-                    }
-                    Some("memberEmail") => {
-                        if let Some(m) = current_member.as_mut() {
-                            m.email = Some(text);
-                        }
-                    }
-                    Some("category") => item.categories.push(text),
-                    Some("child") => item.children.push(text),
-                    Some("company") => item.companies.push(text),
-                    Some("entryValue") => {
-                        let key = entry_key.clone().unwrap_or_default();
-                        match entry_container {
-                            Some("email") => item.emails.push((key, text)),
-                            Some("phone") => item.phones.push((key, text)),
-                            Some("im") => item.ims.push((key, text)),
-                            _ => {}
-                        }
-                    }
-                    _ => {}
+            Event::Text(ref t) => {
+                cur.push_str(&t.decode().map(|c| c.into_owned()).unwrap_or_default());
+            }
+            Event::CData(ref c) => {
+                cur.push_str(&String::from_utf8_lossy(c.as_ref()));
+            }
+            Event::GeneralRef(ref g) => {
+                if let Some(c) = entity_to_char(g) {
+                    cur.push(c);
                 }
             }
             Event::Eof => break,
@@ -1890,6 +1949,7 @@ fn parse_attachment_ref<R: BufRead>(
     let mut buf = Vec::new();
     let mut depth: u32 = 1;
     let mut current: Option<&'static str> = None;
+    let mut cur = String::new();
     loop {
         buf.clear();
         let (ns, ev) = xml.read_resolved_event_into(&mut buf)?;
@@ -1902,6 +1962,7 @@ fn parse_attachment_ref<R: BufRead>(
                 }
                 let local = e.local_name().as_ref().to_vec();
                 if ns_kind == Ns::Types {
+                    cur.clear();
                     if local.eq_ignore_ascii_case(b"AttachmentId") {
                         if let Some(v) = attr_value(e, b"Id") {
                             att.attachment_id = v;
@@ -1921,24 +1982,35 @@ fn parse_attachment_ref<R: BufRead>(
                 }
             }
             Event::End(_) => {
+                if let Some(field) = current.take() {
+                    let text = std::mem::take(&mut cur);
+                    match field {
+                        "name" => att.name = Some(text),
+                        "contentType" => att.content_type = Some(text),
+                        "isContactPhoto" => {
+                            att.is_contact_photo = matches!(text.trim(), "true" | "1");
+                        }
+                        _ => {}
+                    }
+                }
+                cur.clear();
                 if depth == 0 {
                     break;
                 }
                 depth -= 1;
-                current = None;
                 if depth == 0 {
                     break;
                 }
             }
-            Event::Text(t) => {
-                let text = t.decode().map(|c| c.into_owned()).unwrap_or_default();
-                match current {
-                    Some("name") => att.name = Some(text),
-                    Some("contentType") => att.content_type = Some(text),
-                    Some("isContactPhoto") => {
-                        att.is_contact_photo = matches!(text.trim(), "true" | "1");
-                    }
-                    _ => {}
+            Event::Text(ref t) => {
+                cur.push_str(&t.decode().map(|c| c.into_owned()).unwrap_or_default());
+            }
+            Event::CData(ref c) => {
+                cur.push_str(&String::from_utf8_lossy(c.as_ref()));
+            }
+            Event::GeneralRef(ref g) => {
+                if let Some(c) = entity_to_char(g) {
+                    cur.push(c);
                 }
             }
             Event::Eof => break,
@@ -2019,12 +2091,30 @@ pub fn parse_get_attachment_inline(body: &[u8]) -> Result<Vec<GetAttachmentInlin
 
                 if let Some(cur) = current.as_mut() {
                     match text_target {
-                        Some("name") => cur.name = Some(text),
-                        Some("contentType") => cur.content_type = Some(text),
+                        Some("name") => {
+                            cur.name.get_or_insert_with(String::new).push_str(&text);
+                        }
+                        Some("contentType") => {
+                            cur.content_type
+                                .get_or_insert_with(String::new)
+                                .push_str(&text);
+                        }
                         Some("isContactPhoto") => {
                             cur.is_contact_photo = matches!(text.trim(), "true" | "1");
                         }
                         Some("content") => cur.content_base64.push_str(&text),
+                        _ => {}
+                    }
+                }
+            }
+            Event::GeneralRef(ref g) => {
+                if let (Some(cur), Some(c)) = (current.as_mut(), entity_to_char(g)) {
+                    match text_target {
+                        Some("name") => cur.name.get_or_insert_with(String::new).push(c),
+                        Some("contentType") => {
+                            cur.content_type.get_or_insert_with(String::new).push(c)
+                        }
+                        Some("content") => cur.content_base64.push(c),
                         _ => {}
                     }
                 }
@@ -2295,6 +2385,74 @@ mod tests {
         assert_eq!(parsed.members.len(), 2);
         assert_eq!(parsed.members[0].email.as_deref(), Some("bob@x"));
         assert_eq!(parsed.members[1].name.as_deref(), Some("Carol"));
+    }
+
+    #[test]
+    fn contact_decodes_xml_entities() {
+        let body = format!(
+            "<t:Contact{NS}>\
+             <t:ItemId Id=\"C1\" ChangeKey=\"K1\"/>\
+             <t:Categories><t:String>R&amp;D</t:String></t:Categories>\
+             <t:DisplayName>Sales &amp; Marketing &lt;Team&gt;</t:DisplayName>\
+             <t:CompanyName>AT&amp;T</t:CompanyName>\
+             <t:Department>R&amp;D</t:Department>\
+             <t:EmailAddresses><t:Entry Key=\"EmailAddress1\">a&amp;b@x.com</t:Entry></t:EmailAddresses>\
+             </t:Contact>"
+        );
+        let parsed = parse_contact_item(&body).unwrap();
+        assert_eq!(
+            parsed.display_name.as_deref(),
+            Some("Sales & Marketing <Team>")
+        );
+        assert_eq!(parsed.company_name.as_deref(), Some("AT&T"));
+        assert_eq!(parsed.department.as_deref(), Some("R&D"));
+        assert_eq!(parsed.categories, vec!["R&D".to_owned()]);
+        assert_eq!(parsed.emails[0].1, "a&b@x.com");
+    }
+
+    #[test]
+    fn calendar_decodes_xml_entities_in_subject_and_location() {
+        let body = format!(
+            "<t:CalendarItem{NS}>\
+             <t:ItemId Id=\"E1\" ChangeKey=\"K\"/>\
+             <t:Subject>Q&amp;A &lt;all hands&gt;</t:Subject>\
+             <t:Location>Room A &amp; B</t:Location>\
+             <t:Start>2025-06-15T14:00:00Z</t:Start>\
+             <t:End>2025-06-15T15:00:00Z</t:End>\
+             </t:CalendarItem>"
+        );
+        let parsed = parse_calendar_item(&body).unwrap();
+        assert_eq!(parsed.subject.as_deref(), Some("Q&A <all hands>"));
+        assert_eq!(parsed.location.as_deref(), Some("Room A & B"));
+    }
+
+    #[test]
+    fn folder_decodes_xml_entities_in_display_name() {
+        let body = format!(
+            "<t:Folder{NS}><t:FolderId Id=\"F1\" ChangeKey=\"K\"/>\
+             <t:DisplayName>Sales &amp; Marketing</t:DisplayName>\
+             <t:FolderClass>IPF.Note</t:FolderClass></t:Folder>"
+        );
+        let entry = parse_folder_inner(&body).unwrap().unwrap();
+        assert_eq!(entry.display_name, "Sales & Marketing");
+    }
+
+    #[test]
+    fn response_capture_preserves_entities_for_reparse() {
+        let body = format!(
+            "<m:GetItemResponse{NS}><m:ResponseMessages><m:GetItemResponseMessage ResponseClass=\"Success\">\
+             <m:ResponseCode>NoError</m:ResponseCode><m:Items>\
+             <t:Contact><t:ItemId Id=\"C1\" ChangeKey=\"K\"/><t:CompanyName>AT&amp;T</t:CompanyName></t:Contact>\
+             </m:Items></m:GetItemResponseMessage></m:ResponseMessages></m:GetItemResponse>"
+        );
+        let msgs = parse_response_messages(body.as_bytes(), b"GetItemResponseMessage").unwrap();
+        assert!(
+            msgs[0].inner_xml.contains("AT&amp;T") || msgs[0].inner_xml.contains("AT&T"),
+            "capture must preserve the entity for the per-item parser: {}",
+            msgs[0].inner_xml
+        );
+        let parsed = parse_contact_item(&msgs[0].inner_xml).unwrap();
+        assert_eq!(parsed.company_name.as_deref(), Some("AT&T"));
     }
 
     #[test]

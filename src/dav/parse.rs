@@ -7,7 +7,7 @@
 use std::io::BufRead;
 
 use quick_xml::NsReader;
-use quick_xml::events::Event;
+use quick_xml::events::{BytesRef, Event};
 use quick_xml::name::ResolveResult;
 
 use crate::dav::href::{Href, normalise};
@@ -116,8 +116,23 @@ enum Step {
     },
     Text(String),
     CData(String),
+    Entity(char),
     Other,
     Eof,
+}
+
+fn resolve_entity(g: &BytesRef) -> Option<char> {
+    if let Ok(Some(c)) = g.resolve_char_ref() {
+        return Some(c);
+    }
+    match g.decode().ok()?.as_ref() {
+        "amp" => Some('&'),
+        "lt" => Some('<'),
+        "gt" => Some('>'),
+        "quot" => Some('"'),
+        "apos" => Some('\''),
+        _ => None,
+    }
 }
 
 fn next_step<R: BufRead>(xml: &mut NsReader<R>, buf: &mut Vec<u8>) -> Result<Step, ParseError> {
@@ -158,6 +173,10 @@ fn next_step<R: BufRead>(xml: &mut NsReader<R>, buf: &mut Vec<u8>) -> Result<Ste
             Step::Text(s.into_owned())
         }
         Event::CData(cd) => Step::CData(String::from_utf8_lossy(cd.as_ref()).into_owned()),
+        Event::GeneralRef(g) => match resolve_entity(&g) {
+            Some(c) => Step::Entity(c),
+            None => Step::Other,
+        },
         Event::Eof => Step::Eof,
         _ => Step::Other,
     })
@@ -445,6 +464,7 @@ fn read_text<R: BufRead>(xml: &mut NsReader<R>) -> Result<String, ParseError> {
         let step = next_step(xml, &mut buf)?;
         match step {
             Step::Text(s) | Step::CData(s) => out.push_str(&s),
+            Step::Entity(c) => out.push(c),
             Step::StartElement { local, .. } => skip_element(xml, &local)?,
             Step::EndElement { .. } | Step::EmptyElement { .. } => break,
             Step::Eof => return Err(ParseError::Xml("unexpected EOF reading text".into())),

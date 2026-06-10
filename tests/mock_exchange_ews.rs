@@ -87,6 +87,31 @@ fn find_folder_pagination_and_classification() {
 }
 
 #[test]
+fn find_item_distribution_list_does_not_clobber_preceding_contact() {
+    let body = envelope(&format!(
+        "<m:FindItemResponse{NS}><m:ResponseMessages><m:FindItemResponseMessage ResponseClass=\"Success\">\
+         <m:ResponseCode>NoError</m:ResponseCode>\
+         <m:RootFolder TotalItemsInView=\"3\" IncludesLastItemInRange=\"true\"><t:Items>\
+         <t:Contact><t:ItemId Id=\"C1\" ChangeKey=\"k1\"/></t:Contact>\
+         <t:Contact><t:ItemId Id=\"C2\" ChangeKey=\"k2\"/></t:Contact>\
+         <t:DistributionList><t:ItemId Id=\"DL1\" ChangeKey=\"k3\"/></t:DistributionList>\
+         </t:Items></m:RootFolder></m:FindItemResponseMessage></m:ResponseMessages></m:FindItemResponse>"
+    ));
+    let parsed = parse_find_item_response(body.as_bytes()).unwrap();
+    assert_eq!(
+        parsed.items.len(),
+        3,
+        "DistributionList must be its own item, not clobber C2"
+    );
+    let ids: Vec<&str> = parsed.items.iter().map(|i| i.id.id.as_str()).collect();
+    assert_eq!(ids, ["C1", "C2", "DL1"]);
+    assert_eq!(
+        parsed.items[2].element.to_ascii_lowercase(),
+        "distributionlist"
+    );
+}
+
+#[test]
 fn find_item_offset_loop_terminates_on_includes_last_true() {
     let mut server = mockito::Server::new();
     let url = format!("{}/EWS/Exchange.asmx", server.url());
@@ -697,6 +722,53 @@ fn http_456_surfaces_as_account_locked_auth_error() {
         EwsError::Auth(m) => assert!(m.contains("locked"), "got {m}"),
         other => panic!("expected Auth error, got {other:?}"),
     }
+}
+
+#[test]
+fn for_each_fetched_item_streams_every_id_across_windows() {
+    use vandelay::logging::Logger;
+    use vandelay::sync::import_exchange_ews::items::{ItemRunCtx, for_each_fetched_item};
+
+    let mut server = mockito::Server::new();
+    let url = format!("{}/EWS/Exchange.asmx", server.url());
+    let one_message = envelope(&format!(
+        "<m:GetItemResponse{NS}><m:ResponseMessages><m:GetItemResponseMessage ResponseClass=\"Success\">\
+         <m:ResponseCode>NoError</m:ResponseCode><m:Items><t:Message><t:ItemId Id=\"X\" ChangeKey=\"K\"/></t:Message></m:Items>\
+         </m:GetItemResponseMessage></m:ResponseMessages></m:GetItemResponse>"
+    ));
+    let _m = server
+        .mock("POST", "/EWS/Exchange.asmx")
+        .with_status(200)
+        .with_header("content-type", TXT_XML)
+        .with_body(&one_message)
+        .expect(5)
+        .create();
+
+    let c = client(0);
+    let ctx = ItemRunCtx {
+        client: &c,
+        url: &url,
+        source_id: 1,
+        batch_size: 1,
+        attachment_batch: 1,
+        connections: 2,
+        use_syncfolderitems: false,
+        sync_batch: 512,
+        logger: Logger::new(0),
+    };
+    let ids: Vec<ItemId> = (0..5).map(|i| ItemId::new(format!("I{i}"), "K")).collect();
+
+    let mut delivered = 0usize;
+    let failed = for_each_fetched_item(&ctx, ItemShape::Message, &ids, |msg| {
+        assert!(msg.success);
+        delivered += 1;
+        Ok(())
+    })
+    .expect("streaming fetch should succeed");
+
+    assert_eq!(delivered, 5, "every id must be delivered exactly once");
+    assert_eq!(failed, 0);
+    _m.assert();
 }
 
 #[test]

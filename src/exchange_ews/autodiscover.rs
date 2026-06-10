@@ -12,6 +12,7 @@ use ureq::config::Config;
 use ureq::tls::{RootCerts, TlsConfig};
 
 use crate::exchange_ews::error::EwsError;
+use crate::exchange_ews::parse::entity_to_char;
 
 const V2_HOST: &str = "https://outlook.office365.com";
 const POX_REQ_NS: &str =
@@ -425,12 +426,14 @@ fn parse_pox_response(body: &[u8]) -> Result<PoxOutcome, EwsError> {
     let mut redirect_addr: Option<String> = None;
     let mut redirect_url: Option<String> = None;
     let mut action: Option<String> = None;
+    let mut cur = String::new();
     loop {
         buf.clear();
         let (_, ev) = xml.read_resolved_event_into(&mut buf)?;
         match ev {
             Event::Start(e) => {
                 let local = e.local_name().as_ref().to_vec();
+                cur.clear();
                 if local.eq_ignore_ascii_case(b"Protocol") {
                     current_type = None;
                 }
@@ -454,20 +457,31 @@ fn parse_pox_response(body: &[u8]) -> Result<PoxOutcome, EwsError> {
             }
             Event::End(e) => {
                 let local = e.local_name().as_ref().to_vec();
+                if let Some(field) = current.take() {
+                    let text = std::mem::take(&mut cur);
+                    match field {
+                        "type" => current_type = Some(text),
+                        "ewsUrl" => ews_url = Some(text),
+                        "action" => action = Some(text),
+                        "redirectAddr" => redirect_addr = Some(text),
+                        "redirectUrl" => redirect_url = Some(text),
+                        _ => {}
+                    }
+                }
+                cur.clear();
                 if local.eq_ignore_ascii_case(b"Protocol") {
                     current_type = None;
                 }
-                current = None;
             }
             Event::Text(t) => {
-                let text = t.decode().map(|c| c.into_owned()).unwrap_or_default();
-                match current {
-                    Some("type") => current_type = Some(text),
-                    Some("ewsUrl") => ews_url = Some(text),
-                    Some("action") => action = Some(text),
-                    Some("redirectAddr") => redirect_addr = Some(text),
-                    Some("redirectUrl") => redirect_url = Some(text),
-                    _ => {}
+                cur.push_str(&t.decode().map(|c| c.into_owned()).unwrap_or_default());
+            }
+            Event::CData(c) => {
+                cur.push_str(&String::from_utf8_lossy(c.as_ref()));
+            }
+            Event::GeneralRef(g) => {
+                if let Some(c) = entity_to_char(&g) {
+                    cur.push(c);
                 }
             }
             Event::Eof => break,

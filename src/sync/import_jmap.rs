@@ -430,13 +430,6 @@ fn insert_objects(
     logger: &Logger,
     counts: &mut TypeCounts,
 ) -> Result<(), Error> {
-    let blob_refs = blob_references(ty, &objects);
-    let blobs = if blob_refs.is_empty() {
-        HashMap::new()
-    } else {
-        download_blobs(net, blob_refs, threads, logger, counts)
-    };
-
     let existing_parents: HashSet<String> =
         if matches!(ty, ObjectType::Mailbox | ObjectType::FileNode) {
             db::ids::jmap_to_local(&ctx.conn, source_id, ty)
@@ -451,6 +444,12 @@ fn insert_objects(
     }
 
     for batch in ordered.chunks(200) {
+        let blob_refs = blob_references(ty, batch.iter().map(|&i| &objects[i]));
+        let blobs = if blob_refs.is_empty() {
+            HashMap::new()
+        } else {
+            download_blobs(net, blob_refs, threads, logger, counts)
+        };
         let tx = ctx
             .conn
             .unchecked_transaction()
@@ -481,7 +480,7 @@ fn insert_objects(
     Ok(())
 }
 
-fn blob_references(ty: ObjectType, objects: &[Value]) -> Vec<BlobRef> {
+fn blob_references<'a>(ty: ObjectType, objects: impl Iterator<Item = &'a Value>) -> Vec<BlobRef> {
     let mut seen: HashSet<String> = HashSet::new();
     let mut refs = Vec::new();
     match ty {
@@ -845,14 +844,13 @@ fn update_objects(
     logger: &Logger,
     counts: &mut TypeCounts,
 ) -> Result<(), Error> {
-    let blob_refs = blob_references(ty, &objects);
-    let blobs = if blob_refs.is_empty() {
-        HashMap::new()
-    } else {
-        download_blobs(net, blob_refs, threads, logger, counts)
-    };
-
     for batch in objects.chunks(200) {
+        let blob_refs = blob_references(ty, batch.iter());
+        let blobs = if blob_refs.is_empty() {
+            HashMap::new()
+        } else {
+            download_blobs(net, blob_refs, threads, logger, counts)
+        };
         let tx = ctx
             .conn
             .unchecked_transaction()

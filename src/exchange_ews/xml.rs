@@ -339,8 +339,11 @@ mod tests {
 
     #[test]
     fn get_item_calendar_shape_lists_calendar_fields() {
-        let body =
-            get_item_body(ItemShape::CalendarItem, &[ItemId::new("X", "")], ServerVersion::Exchange2010Sp2);
+        let body = get_item_body(
+            ItemShape::CalendarItem,
+            &[ItemId::new("X", "")],
+            ServerVersion::Exchange2010Sp2,
+        );
         assert!(body.contains("calendar:Recurrence"));
         assert!(body.contains("calendar:ModifiedOccurrences"));
         assert!(body.contains("calendar:DeletedOccurrences"));
@@ -350,8 +353,11 @@ mod tests {
 
     #[test]
     fn get_item_contact_shape_requests_all_properties() {
-        let body =
-            get_item_body(ItemShape::Contact, &[ItemId::new("X", "")], ServerVersion::Exchange2013Sp1);
+        let body = get_item_body(
+            ItemShape::Contact,
+            &[ItemId::new("X", "")],
+            ServerVersion::Exchange2013Sp1,
+        );
         assert!(body.contains("<t:BaseShape>AllProperties</t:BaseShape>"));
     }
 
@@ -379,12 +385,18 @@ mod tests {
 
     #[test]
     fn calendar_timezone_fields_gated_on_exchange_2010() {
-        let modern =
-            get_item_body(ItemShape::CalendarItem, &[ItemId::new("X", "")], ServerVersion::Exchange2010);
+        let modern = get_item_body(
+            ItemShape::CalendarItem,
+            &[ItemId::new("X", "")],
+            ServerVersion::Exchange2010,
+        );
         assert!(modern.contains("calendar:StartTimeZone"));
         assert!(modern.contains("calendar:EndTimeZone"));
-        let legacy =
-            get_item_body(ItemShape::CalendarItem, &[ItemId::new("X", "")], ServerVersion::Exchange2007);
+        let legacy = get_item_body(
+            ItemShape::CalendarItem,
+            &[ItemId::new("X", "")],
+            ServerVersion::Exchange2007,
+        );
         assert!(
             !legacy.contains("TimeZone"),
             "StartTimeZone/EndTimeZone are Exchange 2010 additions"
