@@ -147,6 +147,10 @@ pub fn get_item_body(shape: ItemShape, ids: &[ItemId], version: ServerVersion) -
             out.push_str("<t:FieldURI FieldURI=\"item:ParentFolderId\"/>");
             if version >= ServerVersion::Exchange2013 {
                 out.push_str("<t:FieldURI FieldURI=\"item:Flag\"/>");
+            } else {
+                out.push_str(
+                    "<t:ExtendedFieldURI PropertyTag=\"0x1090\" PropertyType=\"Integer\"/>",
+                );
             }
             out.push_str("<t:FieldURI FieldURI=\"message:IsReadReceiptRequested\"/>");
             out.push_str("</t:AdditionalProperties>");
@@ -328,6 +332,14 @@ mod tests {
         assert!(
             !legacy.contains("item:Flag"),
             "item:Flag is an Exchange 2013 schema addition; must be omitted on 2010"
+        );
+        assert!(
+            legacy.contains("PropertyTag=\"0x1090\""),
+            "on pre-2013 the follow-up flag must be fetched via the PidTagFlagStatus extended property"
+        );
+        assert!(
+            !modern.contains("0x1090"),
+            "the extended-property fallback is only used when item:Flag is unavailable"
         );
         assert!(legacy.contains("item:DateTimeReceived"));
         assert!(legacy.contains("message:IsReadReceiptRequested"));

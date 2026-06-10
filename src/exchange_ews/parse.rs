@@ -956,6 +956,7 @@ pub fn parse_message_item(inner_xml: &str) -> Result<MessageItem, EwsError> {
     let mut mime_charset: Option<String> = None;
     let mut category_collecting = false;
     let mut in_flag = false;
+    let mut in_flagstatus_ext = false;
     let mut cur = String::new();
     loop {
         buf.clear();
@@ -999,6 +1000,13 @@ pub fn parse_message_item(inner_xml: &str) -> Result<MessageItem, EwsError> {
                         in_flag = true;
                     } else if in_flag && local.eq_ignore_ascii_case(b"FlagStatus") {
                         current = Some("flagStatus");
+                    } else if local.eq_ignore_ascii_case(b"ExtendedFieldURI") {
+                        if let Some(tag) = attr_value(e, b"PropertyTag") {
+                            let t = tag.trim().to_ascii_lowercase();
+                            in_flagstatus_ext = t == "0x1090" || t == "4240";
+                        }
+                    } else if in_flagstatus_ext && local.eq_ignore_ascii_case(b"Value") {
+                        current = Some("flagStatusExt");
                     } else {
                         current = None;
                     }
@@ -1027,6 +1035,9 @@ pub fn parse_message_item(inner_xml: &str) -> Result<MessageItem, EwsError> {
                         }
                         "category" => item.categories.push(text),
                         "flagStatus" => item.flag_status = Some(text),
+                        "flagStatusExt" if text.trim() == "2" => {
+                            item.flag_status = Some("Flagged".to_owned());
+                        }
                         _ => {}
                     }
                 }
@@ -1035,6 +1046,8 @@ pub fn parse_message_item(inner_xml: &str) -> Result<MessageItem, EwsError> {
                     category_collecting = false;
                 } else if lower == b"flag" {
                     in_flag = false;
+                } else if lower == b"extendedproperty" {
+                    in_flagstatus_ext = false;
                 }
             }
             Event::Text(ref t) => {
@@ -2246,6 +2259,64 @@ mod tests {
         assert_eq!(parsed.mime_content.as_deref(), Some("SGVsbG8="));
         assert!(!r[1].success);
         assert!(matches!(r[1].response_code, ResponseCode::ItemNotFound));
+    }
+
+    #[test]
+    fn pid_tag_flag_status_extended_property_marks_message_flagged() {
+        fn parse_one(message_xml: &str) -> MessageItem {
+            let body = format!(
+                "<m:GetItemResponse{NS}><m:ResponseMessages>\
+                 <m:GetItemResponseMessage ResponseClass=\"Success\">\
+                   <m:ResponseCode>NoError</m:ResponseCode>\
+                   <m:Items>{message_xml}</m:Items>\
+                 </m:GetItemResponseMessage></m:ResponseMessages></m:GetItemResponse>"
+            );
+            let r = parse_response_messages(body.as_bytes(), b"GetItemResponseMessage").unwrap();
+            parse_message_item(&r[0].inner_xml).unwrap()
+        }
+
+        let flagged = parse_one(
+            "<t:Message><t:ItemId Id=\"F1\" ChangeKey=\"K\"/>\
+             <t:Subject>Flagged</t:Subject>\
+             <t:ExtendedProperty>\
+               <t:ExtendedFieldURI PropertyTag=\"0x1090\" PropertyType=\"Integer\"/>\
+               <t:Value>2</t:Value>\
+             </t:ExtendedProperty>\
+             <t:IsRead>true</t:IsRead></t:Message>",
+        );
+        assert_eq!(flagged.flag_status.as_deref(), Some("Flagged"));
+        assert_eq!(flagged.is_read, Some(true));
+
+        let cleared = parse_one(
+            "<t:Message><t:ItemId Id=\"F2\" ChangeKey=\"K\"/>\
+             <t:ExtendedProperty>\
+               <t:ExtendedFieldURI PropertyTag=\"0x1090\" PropertyType=\"Integer\"/>\
+               <t:Value>0</t:Value>\
+             </t:ExtendedProperty></t:Message>",
+        );
+        assert_eq!(cleared.flag_status, None);
+    }
+
+    #[test]
+    fn native_item_flag_still_parses_on_exchange_2013_plus() {
+        let body = format!(
+            "<m:GetItemResponse{NS}><m:ResponseMessages>\
+             <m:GetItemResponseMessage ResponseClass=\"Success\">\
+               <m:ResponseCode>NoError</m:ResponseCode>\
+               <m:Items><t:Message><t:ItemId Id=\"M\" ChangeKey=\"K\"/>\
+                 <t:Subject>Native</t:Subject>\
+                 <t:Flag><t:FlagStatus>Flagged</t:FlagStatus></t:Flag>\
+                 <t:IsRead>false</t:IsRead></t:Message></m:Items>\
+             </m:GetItemResponseMessage></m:ResponseMessages></m:GetItemResponse>"
+        );
+        let r = parse_response_messages(body.as_bytes(), b"GetItemResponseMessage").unwrap();
+        let p = parse_message_item(&r[0].inner_xml).unwrap();
+        assert_eq!(
+            p.flag_status.as_deref(),
+            Some("Flagged"),
+            "the 2013+ native item:Flag path must be unaffected by the pre-2013 extended-property fallback"
+        );
+        assert_eq!(p.is_read, Some(false));
     }
 
     #[test]

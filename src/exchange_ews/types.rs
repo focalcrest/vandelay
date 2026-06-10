@@ -148,6 +148,23 @@ impl ServerVersion {
     }
 }
 
+const SKIPPED_CONTAINER_CLASSES: [&str; 8] = [
+    "ipf.task",
+    "ipf.journal",
+    "ipf.stickynote",
+    "ipf.configuration",
+    "ipf.storeitem",
+    "ipf.skypeteams",
+    "ipf.files",
+    "ipf.note.outlookhomepage",
+];
+
+fn class_matches(lower_class: &str, lower_prefix: &str) -> bool {
+    lower_class == lower_prefix
+        || (lower_class.starts_with(lower_prefix)
+            && lower_class[lower_prefix.len()..].starts_with('.'))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FolderClass {
     Mail,
@@ -158,17 +175,24 @@ pub enum FolderClass {
 
 impl FolderClass {
     pub fn from_ipf(class: &str) -> FolderClass {
-        if class.eq_ignore_ascii_case("IPF.Note") {
-            FolderClass::Mail
-        } else if class.eq_ignore_ascii_case("IPF.Appointment")
-            || class.starts_with("IPF.Appointment.")
-        {
+        let lower = class.trim().to_ascii_lowercase();
+        if class_matches(&lower, "ipf.appointment") {
             FolderClass::Calendar
-        } else if class.eq_ignore_ascii_case("IPF.Contact") || class.starts_with("IPF.Contact.") {
+        } else if class_matches(&lower, "ipf.contact") {
             FolderClass::Contacts
-        } else {
+        } else if SKIPPED_CONTAINER_CLASSES
+            .iter()
+            .any(|p| class_matches(&lower, p))
+        {
             FolderClass::Skipped
+        } else {
+            FolderClass::Mail
         }
+    }
+
+    pub fn is_mail_fallback(class: &str) -> bool {
+        let lower = class.trim().to_ascii_lowercase();
+        FolderClass::from_ipf(class) == FolderClass::Mail && !class_matches(&lower, "ipf.note")
     }
 }
 
@@ -298,6 +322,34 @@ mod tests {
         );
         assert_eq!(FolderClass::from_ipf("IPF.Contact"), FolderClass::Contacts);
         assert_eq!(FolderClass::from_ipf("IPF.Task"), FolderClass::Skipped);
+    }
+
+    #[test]
+    fn absent_or_unknown_folder_class_falls_back_to_mail() {
+        assert_eq!(FolderClass::from_ipf(""), FolderClass::Mail);
+        assert_eq!(FolderClass::from_ipf("   "), FolderClass::Mail);
+        assert_eq!(FolderClass::from_ipf("IPF.SomethingNew"), FolderClass::Mail);
+        assert!(FolderClass::is_mail_fallback(""));
+        assert!(FolderClass::is_mail_fallback("IPF.SomethingNew"));
+        assert!(!FolderClass::is_mail_fallback("IPF.Note"));
+        assert!(!FolderClass::is_mail_fallback("IPF.Note.OutlookHomepage"));
+        assert!(!FolderClass::is_mail_fallback("IPF.Task"));
+    }
+
+    #[test]
+    fn internal_and_out_of_scope_classes_are_skipped() {
+        for c in [
+            "IPF.Task",
+            "IPF.Journal",
+            "IPF.StickyNote",
+            "IPF.Configuration",
+            "IPF.StoreItem.PdpProfileV2Secured",
+            "IPF.SkypeTeams.Message",
+            "IPF.Files",
+            "IPF.Note.OutlookHomepage",
+        ] {
+            assert_eq!(FolderClass::from_ipf(c), FolderClass::Skipped, "{c}");
+        }
     }
 
     #[test]

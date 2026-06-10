@@ -20,7 +20,7 @@ use crate::exchange_ews::types::{DistinguishedFolderId, FolderClass, MailboxKind
 use crate::exchange_ews::xml::{
     FolderRef, FolderShape, Traversal, find_folder_body, get_folder_body,
 };
-use crate::logging::{LEVEL_PROGRESS, Logger};
+use crate::logging::{LEVEL_DEFAULT, LEVEL_PROGRESS, Logger};
 use crate::sync::TypeCounts;
 
 pub struct FolderPlan {
@@ -55,6 +55,20 @@ pub fn plan_folders(
     let mut contacts = Vec::new();
     for folder in parsed.folders {
         let class = FolderClass::from_ipf(&folder.folder_class);
+        if class == FolderClass::Mail
+            && FolderClass::is_mail_fallback(&folder.folder_class)
+            && logger.enabled(LEVEL_DEFAULT)
+        {
+            let shown = if folder.folder_class.trim().is_empty() {
+                "no"
+            } else {
+                "unrecognized"
+            };
+            eprintln!(
+                "warning: EWS folder {:?} has {shown} FolderClass ({:?}); importing as mail",
+                folder.display_name, folder.folder_class
+            );
+        }
         match (mailbox_kind, class) {
             (MailboxKind::Archive, FolderClass::Mail) => {
                 mail.push(ClassifiedFolder {
@@ -163,13 +177,26 @@ const WELL_KNOWN_ROLES: &[(DistinguishedFolderId, Option<&'static str>)] = &[
     (DistinguishedFolderId::ConversationHistory, None),
 ];
 
+struct DeleteTarget<'a> {
+    type_name: &'a str,
+    table: &'a str,
+    counts: &'a mut TypeCounts,
+}
+
+pub struct ReconcileCounts<'a> {
+    pub mailbox: &'a mut TypeCounts,
+    pub calendar: &'a mut TypeCounts,
+    pub addressbook: &'a mut TypeCounts,
+    pub email: &'a mut TypeCounts,
+    pub calendar_event: &'a mut TypeCounts,
+    pub contact: &'a mut TypeCounts,
+}
+
 pub fn reconcile(
     conn: &mut Connection,
     source_id: i64,
     plan: &FolderPlan,
-    mailbox_counts: &mut TypeCounts,
-    calendar_counts: &mut TypeCounts,
-    addressbook_counts: &mut TypeCounts,
+    counts: &mut ReconcileCounts<'_>,
     _logger: Logger,
 ) -> Result<(), Error> {
     let local_mailbox: HashMap<String, exchange_ews_ids::FolderRow> =
@@ -210,7 +237,7 @@ pub fn reconcile(
             source_id,
             id_to_local: &mut id_to_local,
             local: &local_mailbox,
-            counts: mailbox_counts,
+            counts: &mut *counts.mailbox,
             root_folder_id: &plan.root_folder_id,
         };
         upsert_mailbox(&mut ctx, folder, role)?;
@@ -222,7 +249,7 @@ pub fn reconcile(
             source_id,
             id_to_local: &mut id_to_local,
             local: &local_calendar,
-            counts: calendar_counts,
+            counts: &mut *counts.calendar,
             root_folder_id: &plan.root_folder_id,
         };
         upsert_calendar(&mut ctx, folder)?;
@@ -234,7 +261,7 @@ pub fn reconcile(
             source_id,
             id_to_local: &mut id_to_local,
             local: &local_addressbook,
-            counts: addressbook_counts,
+            counts: &mut *counts.addressbook,
             root_folder_id: &plan.root_folder_id,
         };
         upsert_address_book(&mut ctx, folder)?;
@@ -243,29 +270,50 @@ pub fn reconcile(
     delete_vanished(
         conn,
         source_id,
-        exchange_ews_ids::MAILBOX,
-        "mailboxes",
         &local_mailbox,
         &server_ids_mail,
-        mailbox_counts,
+        DeleteTarget {
+            type_name: exchange_ews_ids::MAILBOX,
+            table: "mailboxes",
+            counts: counts.mailbox,
+        },
+        Some(DeleteTarget {
+            type_name: exchange_ews_ids::EMAIL,
+            table: "emails",
+            counts: counts.email,
+        }),
     )?;
     delete_vanished(
         conn,
         source_id,
-        exchange_ews_ids::CALENDAR,
-        "calendars",
         &local_calendar,
         &server_ids_calendar,
-        calendar_counts,
+        DeleteTarget {
+            type_name: exchange_ews_ids::CALENDAR,
+            table: "calendars",
+            counts: counts.calendar,
+        },
+        Some(DeleteTarget {
+            type_name: exchange_ews_ids::CALENDAR_EVENT,
+            table: "calendar_events",
+            counts: counts.calendar_event,
+        }),
     )?;
     delete_vanished(
         conn,
         source_id,
-        exchange_ews_ids::ADDRESS_BOOK,
-        "address_books",
         &local_addressbook,
         &server_ids_addressbook,
-        addressbook_counts,
+        DeleteTarget {
+            type_name: exchange_ews_ids::ADDRESS_BOOK,
+            table: "address_books",
+            counts: counts.addressbook,
+        },
+        Some(DeleteTarget {
+            type_name: exchange_ews_ids::CONTACT_CARD,
+            table: "contact_cards",
+            counts: counts.contact,
+        }),
     )?;
     Ok(())
 }
@@ -487,11 +535,10 @@ fn parent_local_id(
 fn delete_vanished(
     conn: &mut Connection,
     source_id: i64,
-    type_name: &str,
-    table: &str,
     local: &HashMap<String, exchange_ews_ids::FolderRow>,
     server_ids: &[String],
-    counts: &mut TypeCounts,
+    target: DeleteTarget<'_>,
+    mut child: Option<DeleteTarget<'_>>,
 ) -> Result<(), Error> {
     let server_set: std::collections::HashSet<&str> =
         server_ids.iter().map(String::as_str).collect();
@@ -500,27 +547,62 @@ fn delete_vanished(
         .filter(|(id, _)| !server_set.contains(id.as_str()))
         .map(|(id, row)| (id.as_str(), row))
         .collect();
-    if type_name == exchange_ews_ids::MAILBOX {
+    if target.type_name == exchange_ews_ids::MAILBOX {
         vanished.sort_by_key(|(_, row)| std::cmp::Reverse(folder_depth(row, local)));
     }
     for (item_id, row) in vanished {
+        if let Some(c) = child.as_mut() {
+            delete_folder_children(conn, source_id, item_id, c)?;
+        }
         let tx = conn
             .unchecked_transaction()
             .map_err(|e| Error::Partial(e.to_string()))?;
         let result = tx.execute(
-            &format!("DELETE FROM {table} WHERE id = ?1"),
+            &format!("DELETE FROM {} WHERE id = ?1", target.table),
             params![row.local_id],
         );
         match result {
             Ok(_) => {
-                exchange_ews_ids::delete_item(&tx, source_id, type_name, item_id)
+                exchange_ews_ids::delete_item(&tx, source_id, target.type_name, item_id)
                     .map_err(|e| Error::Partial(e.to_string()))?;
                 tx.commit().map_err(|e| Error::Partial(e.to_string()))?;
-                counts.deleted += 1;
+                target.counts.deleted += 1;
             }
             Err(_) => {
                 let _ = tx.rollback();
-                counts.failed += 1;
+                target.counts.failed += 1;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn delete_folder_children(
+    conn: &mut Connection,
+    source_id: i64,
+    folder_item_id: &str,
+    child: &mut DeleteTarget<'_>,
+) -> Result<(), Error> {
+    let kids = exchange_ews_ids::items_in_folder(conn, source_id, child.type_name, folder_item_id)
+        .map_err(|e| Error::Partial(e.to_string()))?;
+    for kid in kids {
+        let tx = conn
+            .unchecked_transaction()
+            .map_err(|e| Error::Partial(e.to_string()))?;
+        let deleted = tx.execute(
+            &format!("DELETE FROM {} WHERE id = ?1", child.table),
+            params![kid.local_id],
+        );
+        match deleted {
+            Ok(_) => {
+                exchange_ews_ids::delete_item(&tx, source_id, child.type_name, &kid.item_id)
+                    .map_err(|e| Error::Partial(e.to_string()))?;
+                tx.commit().map_err(|e| Error::Partial(e.to_string()))?;
+                child.counts.deleted += 1;
+            }
+            Err(_) => {
+                let _ = tx.rollback();
+                child.counts.failed += 1;
             }
         }
     }
@@ -549,6 +631,98 @@ fn folder_depth(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn vanished_folder_cascades_deletion_of_its_child_items() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::db::init::apply_schema(&conn).unwrap();
+        let sid = crate::db::sources::upsert_source(
+            &conn,
+            &crate::db::sources::SourceKey {
+                kind: "exchange_ews".to_owned(),
+                session_url: "https://x/EWS/Exchange.asmx".to_owned(),
+                account_id: "u@d".to_owned(),
+            },
+            Some("u"),
+            "u@d",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO blobs (id, hash, data) VALUES (1, X'00', X'01')",
+            [],
+        )
+        .unwrap();
+        conn.execute("INSERT INTO mailboxes (id, name) VALUES (10, 'Tasks')", [])
+            .unwrap();
+        conn.execute(
+            "INSERT INTO emails (id, blob_id, received_at, mailbox_ids) VALUES (20, 1, '', '[10]')",
+            [],
+        )
+        .unwrap();
+        exchange_ews_ids::insert(
+            &conn,
+            sid,
+            exchange_ews_ids::MAILBOX,
+            "",
+            "FOLDER",
+            "CK",
+            10,
+        )
+        .unwrap();
+        exchange_ews_ids::insert(
+            &conn,
+            sid,
+            exchange_ews_ids::EMAIL,
+            "FOLDER",
+            "MAIL",
+            "CK",
+            20,
+        )
+        .unwrap();
+
+        let mut conn = conn;
+        let local =
+            exchange_ews_ids::folders_of_type(&conn, sid, exchange_ews_ids::MAILBOX).unwrap();
+        let mut folder_counts = TypeCounts::default();
+        let mut email_counts = TypeCounts::default();
+        delete_vanished(
+            &mut conn,
+            sid,
+            &local,
+            &[],
+            DeleteTarget {
+                type_name: exchange_ews_ids::MAILBOX,
+                table: "mailboxes",
+                counts: &mut folder_counts,
+            },
+            Some(DeleteTarget {
+                type_name: exchange_ews_ids::EMAIL,
+                table: "emails",
+                counts: &mut email_counts,
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(folder_counts.deleted, 1);
+        assert_eq!(
+            email_counts.deleted, 1,
+            "child email must be cascade-deleted"
+        );
+        let mailboxes: i64 = conn
+            .query_row("SELECT count(*) FROM mailboxes", [], |r| r.get(0))
+            .unwrap();
+        let emails: i64 = conn
+            .query_row("SELECT count(*) FROM emails", [], |r| r.get(0))
+            .unwrap();
+        let orphan_idmap: i64 = conn
+            .query_row("SELECT count(*) FROM sync_id_exchange_ews", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(mailboxes, 0);
+        assert_eq!(emails, 0, "no orphaned email row may remain");
+        assert_eq!(orphan_idmap, 0, "both idmap rows must be removed");
+    }
 
     fn row(id: &str, parent_ews_id: &str, local_id: i64) -> exchange_ews_ids::FolderRow {
         exchange_ews_ids::FolderRow {

@@ -92,35 +92,52 @@ pub fn to_jscontact(raw: &ContactItemRaw) -> Value {
             Value::Object(map_singleton("1", json!({"@type": "Title", "name": t}))),
         );
     }
-    if !raw.emails.is_empty() {
+    {
         let mut map = Map::new();
-        for (i, (key, addr)) in raw.emails.iter().enumerate() {
-            let entry_id = format!("{}", i + 1);
+        for (i, (key, addr)) in raw
+            .emails
+            .iter()
+            .filter(|(_, v)| !v.trim().is_empty())
+            .enumerate()
+        {
             let mut entry = Map::new();
             entry.insert("@type".to_owned(), Value::String("EmailAddress".to_owned()));
             entry.insert("address".to_owned(), Value::String(addr.clone()));
             entry.insert("contexts".to_owned(), email_contexts(key));
-            map.insert(entry_id, Value::Object(entry));
+            map.insert((i + 1).to_string(), Value::Object(entry));
         }
-        card.insert("emails".to_owned(), Value::Object(map));
+        if !map.is_empty() {
+            card.insert("emails".to_owned(), Value::Object(map));
+        }
     }
-    if !raw.phones.is_empty() {
+    {
         let mut map = Map::new();
-        for (i, (key, num)) in raw.phones.iter().enumerate() {
-            let entry_id = format!("{}", i + 1);
+        for (i, (key, num)) in raw
+            .phones
+            .iter()
+            .filter(|(_, v)| !v.trim().is_empty())
+            .enumerate()
+        {
             let mut entry = Map::new();
             entry.insert("@type".to_owned(), Value::String("Phone".to_owned()));
             entry.insert("number".to_owned(), Value::String(num.clone()));
             entry.insert("contexts".to_owned(), phone_contexts(key));
             entry.insert("features".to_owned(), phone_features(key));
-            map.insert(entry_id, Value::Object(entry));
+            map.insert((i + 1).to_string(), Value::Object(entry));
         }
-        card.insert("phones".to_owned(), Value::Object(map));
+        if !map.is_empty() {
+            card.insert("phones".to_owned(), Value::Object(map));
+        }
     }
-    if !raw.ims.is_empty() {
+    {
         let mut map = Map::new();
-        for (i, (key, addr)) in raw.ims.iter().enumerate() {
-            let entry_id = format!("{}", i + 1);
+        for (i, (key, addr)) in raw
+            .ims
+            .iter()
+            .filter(|(_, v)| !v.trim().is_empty())
+            .enumerate()
+        {
+            let entry_id = (i + 1).to_string();
             let mut entry = Map::new();
             entry.insert(
                 "@type".to_owned(),
@@ -132,7 +149,9 @@ pub fn to_jscontact(raw: &ContactItemRaw) -> Value {
             }
             map.insert(entry_id, Value::Object(entry));
         }
-        card.insert("onlineServices".to_owned(), Value::Object(map));
+        if !map.is_empty() {
+            card.insert("onlineServices".to_owned(), Value::Object(map));
+        }
     }
     if !raw.addresses.is_empty() {
         let pref_key = raw
@@ -185,7 +204,7 @@ pub fn to_jscontact(raw: &ContactItemRaw) -> Value {
         }
         card.insert("keywords".to_owned(), Value::Object(keywords));
     }
-    if let Some(notes) = raw.notes.as_ref() {
+    if let Some(notes) = raw.notes.as_ref().filter(|n| !n.trim().is_empty()) {
         card.insert(
             "notes".to_owned(),
             Value::Object(map_singleton("1", json!({"@type": "Note", "note": notes}))),
@@ -339,6 +358,29 @@ mod tests {
         assert_eq!(comps[0]["value"], "Alice");
         assert_eq!(v["emails"]["1"]["address"], "alice@x");
         assert_eq!(v["phones"]["1"]["contexts"]["work"], true);
+    }
+
+    #[test]
+    fn empty_body_and_empty_im_entry_are_omitted() {
+        let raw = ContactItemRaw {
+            display_name: Some("Random Person".to_owned()),
+            notes: Some(String::new()),
+            ims: vec![("ImAddress1".to_owned(), String::new())],
+            emails: vec![("EmailAddress1".to_owned(), "  ".to_owned())],
+            phones: vec![("MobilePhone".to_owned(), "+17801234567".to_owned())],
+            ..ContactItemRaw::default()
+        };
+        let v = to_jscontact(&raw);
+        assert!(v.get("notes").is_none(), "empty body must not emit notes");
+        assert!(
+            v.get("onlineServices").is_none(),
+            "empty IM entry must not emit onlineServices"
+        );
+        assert!(
+            v.get("emails").is_none(),
+            "whitespace-only email must not emit emails"
+        );
+        assert_eq!(v["phones"]["1"]["number"], "+17801234567");
     }
 
     #[test]

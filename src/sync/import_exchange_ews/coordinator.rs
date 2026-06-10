@@ -126,9 +126,14 @@ pub fn run(common: CommonConfig, config: EwsImportConfig) -> Result<Summary, Err
         &mut conn,
         source_id,
         &plan,
-        &mut mailbox_counts,
-        &mut calendar_counts,
-        &mut addressbook_counts,
+        &mut folders::ReconcileCounts {
+            mailbox: &mut mailbox_counts,
+            calendar: &mut calendar_counts,
+            addressbook: &mut addressbook_counts,
+            email: &mut email_counts,
+            calendar_event: &mut calendar_event_counts,
+            contact: &mut contact_counts,
+        },
         logger,
     )?;
 

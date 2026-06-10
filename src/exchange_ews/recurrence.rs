@@ -92,10 +92,11 @@ pub fn to_jscalendar_rule(raw: &RawRecurrence) -> Option<Value> {
     match raw.range.as_ref() {
         Some(RecurrenceRange::NoEnd { .. }) | None => {}
         Some(RecurrenceRange::EndDate { end_date, .. }) => {
-            let local = if end_date.contains('T') {
-                end_date.clone()
+            let trimmed = end_date.trim().trim_end_matches('Z');
+            let local = if trimmed.contains('T') {
+                trimmed.to_owned()
             } else {
-                format!("{end_date}T23:59:59")
+                format!("{trimmed}T23:59:59")
             };
             rule.insert("until".to_owned(), Value::String(local));
         }
@@ -343,6 +344,19 @@ mod tests {
             .collect();
         assert_eq!(days, ["sa", "su"]);
         assert_eq!(rule["bySetPosition"], json!([-1]));
+    }
+
+    #[test]
+    fn end_date_with_trailing_z_yields_valid_local_until() {
+        let raw = RawRecurrence {
+            pattern: Some(RecurrencePattern::Daily { interval: 2 }),
+            range: Some(RecurrenceRange::EndDate {
+                start_date: "2026-07-01Z".to_owned(),
+                end_date: "2026-08-01Z".to_owned(),
+            }),
+        };
+        let rule = to_jscalendar_rule(&raw).unwrap();
+        assert_eq!(rule["until"], "2026-08-01T23:59:59");
     }
 
     #[test]
