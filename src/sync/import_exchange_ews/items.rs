@@ -26,7 +26,15 @@ pub struct ItemRunCtx<'a> {
     pub attachment_batch: usize,
     pub connections: usize,
     pub use_syncfolderitems: bool,
+    pub sync_batch: u32,
     pub logger: Logger,
+}
+
+pub const SYNC_BATCH_MAX: u32 = 512;
+const SYNC_BATCH_MIN: u32 = 32;
+
+fn shrink_sync_batch(current: u32) -> u32 {
+    (current / 2).max(SYNC_BATCH_MIN)
 }
 
 #[derive(Debug, Clone)]
@@ -84,8 +92,10 @@ fn try_sync_folder_items(
     let mut items: Vec<EnumeratedItem> = Vec::new();
     let mut deletions: Vec<String> = Vec::new();
     let mut iters = 0;
+    let mut batch = ctx.sync_batch.clamp(SYNC_BATCH_MIN, SYNC_BATCH_MAX);
     loop {
-        let body = sync_folder_items_body(folder, &sync_state, 512);
+        let retries_before = ctx.client.retries_observed();
+        let body = sync_folder_items_body(folder, &sync_state, batch);
         let resp = match ctx.client.call(ctx.url, "SyncFolderItems", &body) {
             Ok(r) => r,
             Err(EwsError::SoapFault {
@@ -114,6 +124,15 @@ fn try_sync_folder_items(
                         id,
                     });
                 }
+            }
+        }
+        if ctx.client.retries_observed() > retries_before {
+            let shrunk = shrink_sync_batch(batch);
+            if shrunk != batch {
+                ctx.logger.warn(&format!(
+                    "EWS SyncFolderItems throttled; shrinking change batch {batch} -> {shrunk}"
+                ));
+                batch = shrunk;
             }
         }
         sync_state = parsed.sync_state;
@@ -382,6 +401,15 @@ pub fn delete_vanished(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sync_batch_shrinks_by_half_down_to_floor() {
+        assert_eq!(shrink_sync_batch(512), 256);
+        assert_eq!(shrink_sync_batch(256), 128);
+        assert_eq!(shrink_sync_batch(64), 32);
+        assert_eq!(shrink_sync_batch(32), 32);
+        assert_eq!(shrink_sync_batch(40), 32);
+    }
 
     #[test]
     fn diff_delta_only_yields_changes_from_server_response() {

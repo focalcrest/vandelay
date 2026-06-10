@@ -89,6 +89,10 @@ pub fn find_item_body(
     out.push_str("\" Offset=\"");
     out.push_str(&offset.to_string());
     out.push_str("\" BasePoint=\"Beginning\"/>");
+    out.push_str(
+        "<m:SortOrder><t:FieldOrder Order=\"Ascending\">\
+         <t:FieldURI FieldURI=\"item:DateTimeCreated\"/></t:FieldOrder></m:SortOrder>",
+    );
     out.push_str("<m:ParentFolderIds>");
     write_folder_ref(&mut out, parent);
     out.push_str("</m:ParentFolderIds></m:FindItem>");
@@ -175,6 +179,12 @@ const CALENDAR_FIELDS: &[&str] = &[
     "calendar:Organizer",
     "calendar:RequiredAttendees",
     "calendar:OptionalAttendees",
+    "calendar:Resources",
+    "calendar:IsOnlineMeeting",
+    "calendar:MeetingWorkspaceUrl",
+    "calendar:NetShowUrl",
+    "item:ReminderIsSet",
+    "item:ReminderMinutesBeforeStart",
     "calendar:Recurrence",
     "calendar:ModifiedOccurrences",
     "calendar:DeletedOccurrences",
@@ -272,6 +282,21 @@ mod tests {
         assert!(body.contains("Offset=\"200\""));
         assert!(body.contains("MaxEntriesReturned=\"50\""));
         assert!(body.contains("<t:FolderId Id=\"FID\" ChangeKey=\"FCK\"/>"));
+    }
+
+    #[test]
+    fn find_item_sorts_by_creation_time_for_stable_paging() {
+        let folder = FolderId::new("FID", "FCK");
+        let body = find_item_body(FolderRef::Concrete(&folder), Traversal::Shallow, 0, 50);
+        assert!(body.contains("<m:SortOrder>"));
+        assert!(body.contains("Order=\"Ascending\""));
+        assert!(body.contains("item:DateTimeCreated"));
+        let sort_at = body.find("<m:SortOrder>").unwrap();
+        let parents_at = body.find("<m:ParentFolderIds>").unwrap();
+        assert!(
+            sort_at < parents_at,
+            "SortOrder must precede ParentFolderIds"
+        );
     }
 
     #[test]

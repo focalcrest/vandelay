@@ -928,7 +928,10 @@ fn coordinator_special_use_drives_role() {
 #[test]
 fn coordinator_omits_special_use_when_unadvertised() {
     let control: Script = Box::new(|conn: &mut MockConn| -> std::io::Result<()> {
-        auth_preamble(conn, "IMAP4rev2 LIST-EXTENDED LIST-STATUS LITERAL+ AUTH=PLAIN")?;
+        auth_preamble(
+            conn,
+            "IMAP4rev2 LIST-EXTENDED LIST-STATUS LITERAL+ AUTH=PLAIN",
+        )?;
         let (tag, cmd) = conn.read_command()?;
         if cmd.contains("SPECIAL-USE") {
             conn.write_line(&format!(

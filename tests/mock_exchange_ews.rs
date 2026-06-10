@@ -13,7 +13,7 @@ use vandelay::exchange_ews::parse::{
     parse_get_attachment_inline, parse_response_messages, parse_sync_folder_items_response,
     read_envelope_summary,
 };
-use vandelay::exchange_ews::types::{FolderId, ItemId, ResponseCode};
+use vandelay::exchange_ews::types::{FolderId, ItemId, ResponseCode, ServerVersion};
 use vandelay::exchange_ews::xml::{
     FolderRef, ItemShape, Traversal, find_folder_body, find_item_body, get_attachment_body,
     get_item_body, sync_folder_items_body,
@@ -503,7 +503,7 @@ fn http_500_with_server_busy_body_is_treated_as_fault_and_retried() {
     ));
     let _m1 = server
         .mock("POST", "/EWS/Exchange.asmx")
-        .with_status(200)
+        .with_status(500)
         .with_header("content-type", TXT_XML)
         .with_body(busy_body)
         .expect(1)
@@ -525,6 +525,178 @@ fn http_500_with_server_busy_body_is_treated_as_fault_and_retried() {
     let r = c.call(&url, "FindFolder", &body).expect("should retry");
     let parsed = parse_find_folder_response(&r.body).unwrap();
     assert!(parsed.folders.is_empty());
+}
+
+#[test]
+fn invalid_server_version_fault_downgrades_and_succeeds() {
+    let mut server = mockito::Server::new();
+    let url = format!("{}/EWS/Exchange.asmx", server.url());
+    let version_fault = format!(
+        "<soap:Envelope{NS}><soap:Body><soap:Fault>\
+         <faultcode>soap:Server</faultcode>\
+         <faultstring>The specified server version is invalid.</faultstring>\
+         <detail><ResponseCode xmlns=\"http://schemas.microsoft.com/exchange/services/2006/types\">ErrorInvalidServerVersion</ResponseCode></detail>\
+         </soap:Fault></soap:Body></soap:Envelope>"
+    );
+    let ok_body = format!(
+        "<soap:Envelope{NS}><soap:Header><t:ServerVersionInfo MajorVersion=\"14\" MinorVersion=\"3\"/></soap:Header>\
+         <soap:Body><m:FindFolderResponse{NS}><m:ResponseMessages><m:FindFolderResponseMessage ResponseClass=\"Success\">\
+         <m:ResponseCode>NoError</m:ResponseCode>\
+         <m:RootFolder TotalItemsInView=\"0\" IncludesLastItemInRange=\"true\"><t:Folders/></m:RootFolder>\
+         </m:FindFolderResponseMessage></m:ResponseMessages></m:FindFolderResponse></soap:Body></soap:Envelope>"
+    );
+
+    let m_sp1 = server
+        .mock("POST", "/EWS/Exchange.asmx")
+        .match_body(Matcher::Regex("Exchange2013_SP1".into()))
+        .with_status(500)
+        .with_header("content-type", TXT_XML)
+        .with_body(&version_fault)
+        .expect(1)
+        .create();
+    let m_2013 = server
+        .mock("POST", "/EWS/Exchange.asmx")
+        .match_body(Matcher::Regex("Exchange2013\"".into()))
+        .with_status(500)
+        .with_header("content-type", TXT_XML)
+        .with_body(&version_fault)
+        .expect(1)
+        .create();
+    let m_2010 = server
+        .mock("POST", "/EWS/Exchange.asmx")
+        .match_body(Matcher::Regex("Exchange2010_SP2".into()))
+        .with_status(200)
+        .with_header("content-type", TXT_XML)
+        .with_body(&ok_body)
+        .expect_at_least(1)
+        .create();
+
+    let c = client(0);
+    assert_eq!(c.server_version(), ServerVersion::Exchange2013Sp1);
+    let body = find_folder_body(
+        FolderRef::Distinguished(
+            vandelay::exchange_ews::types::DistinguishedFolderId::MsgFolderRoot,
+        ),
+        Traversal::Deep,
+    );
+    let r = c
+        .call(&url, "FindFolder", &body)
+        .expect("call should walk the version ladder down to a version the server accepts");
+    let parsed = parse_find_folder_response(&r.body).unwrap();
+    assert!(parsed.folders.is_empty());
+    assert_eq!(c.server_version(), ServerVersion::Exchange2010Sp2);
+    assert_eq!(c.retries_observed(), 0);
+    m_sp1.assert();
+    m_2013.assert();
+    m_2010.assert();
+}
+
+#[test]
+fn unsupported_version_floor_surfaces_as_soap_fault() {
+    let mut server = mockito::Server::new();
+    let url = format!("{}/EWS/Exchange.asmx", server.url());
+    let version_fault = format!(
+        "<soap:Envelope{NS}><soap:Body><soap:Fault>\
+         <faultcode>soap:Server</faultcode>\
+         <faultstring>The specified server version is invalid.</faultstring>\
+         <detail><ResponseCode xmlns=\"http://schemas.microsoft.com/exchange/services/2006/types\">ErrorInvalidServerVersion</ResponseCode></detail>\
+         </soap:Fault></soap:Body></soap:Envelope>"
+    );
+    let _m = server
+        .mock("POST", "/EWS/Exchange.asmx")
+        .with_status(500)
+        .with_header("content-type", TXT_XML)
+        .with_body(&version_fault)
+        .expect_at_least(1)
+        .create();
+
+    let c = client(0);
+    let body = find_folder_body(
+        FolderRef::Distinguished(
+            vandelay::exchange_ews::types::DistinguishedFolderId::MsgFolderRoot,
+        ),
+        Traversal::Deep,
+    );
+    let err = c.call(&url, "FindFolder", &body).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            EwsError::SoapFault {
+                code: ResponseCode::InvalidServerVersion,
+                ..
+            }
+        ),
+        "got {err:?}"
+    );
+    assert_eq!(c.server_version(), ServerVersion::Exchange2007);
+}
+
+#[test]
+fn server_affinity_cookie_is_captured_and_resent() {
+    let mut server = mockito::Server::new();
+    let url = format!("{}/EWS/Exchange.asmx", server.url());
+    let ok_body = envelope(&format!(
+        "<m:FindFolderResponse{NS}><m:ResponseMessages><m:FindFolderResponseMessage ResponseClass=\"Success\">\
+         <m:ResponseCode>NoError</m:ResponseCode>\
+         <m:RootFolder TotalItemsInView=\"0\" IncludesLastItemInRange=\"true\"><t:Folders/></m:RootFolder>\
+         </m:FindFolderResponseMessage></m:ResponseMessages></m:FindFolderResponse>"
+    ));
+    let first = server
+        .mock("POST", "/EWS/Exchange.asmx")
+        .match_header("x-preferserveraffinity", "True")
+        .match_header("x-backendoverridecookie", Matcher::Missing)
+        .with_status(200)
+        .with_header("content-type", TXT_XML)
+        .with_header(
+            "set-cookie",
+            "X-BackEndOverrideCookie=AFFIN123; path=/; HttpOnly",
+        )
+        .with_body(&ok_body)
+        .expect(1)
+        .create();
+    let second = server
+        .mock("POST", "/EWS/Exchange.asmx")
+        .match_header("x-backendoverridecookie", "AFFIN123")
+        .with_status(200)
+        .with_header("content-type", TXT_XML)
+        .with_body(&ok_body)
+        .expect(1)
+        .create();
+
+    let c = client(0);
+    let body = find_folder_body(
+        FolderRef::Distinguished(
+            vandelay::exchange_ews::types::DistinguishedFolderId::MsgFolderRoot,
+        ),
+        Traversal::Deep,
+    );
+    c.call(&url, "FindFolder", &body).expect("first call ok");
+    c.call(&url, "FindFolder", &body).expect("second call ok");
+    first.assert();
+    second.assert();
+}
+
+#[test]
+fn http_456_surfaces_as_account_locked_auth_error() {
+    let mut server = mockito::Server::new();
+    let url = format!("{}/EWS/Exchange.asmx", server.url());
+    let _m = server
+        .mock("POST", "/EWS/Exchange.asmx")
+        .with_status(456)
+        .with_body("Account locked. Unlock at https://unlock.example/")
+        .create();
+    let c = client(0);
+    let body = find_folder_body(
+        FolderRef::Distinguished(
+            vandelay::exchange_ews::types::DistinguishedFolderId::MsgFolderRoot,
+        ),
+        Traversal::Deep,
+    );
+    let err = c.call(&url, "FindFolder", &body).unwrap_err();
+    match err {
+        EwsError::Auth(m) => assert!(m.contains("locked"), "got {m}"),
+        other => panic!("expected Auth error, got {other:?}"),
+    }
 }
 
 #[test]

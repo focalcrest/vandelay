@@ -141,13 +141,19 @@ pub fn to_jscalendar(raw: &CalendarItemRaw) -> EventValue {
         &mut participants,
         &mut next_id,
         &raw.required_attendees,
-        true,
+        AttendeeRole::Required,
     );
     add_attendees(
         &mut participants,
         &mut next_id,
         &raw.optional_attendees,
-        false,
+        AttendeeRole::Optional,
+    );
+    add_attendees(
+        &mut participants,
+        &mut next_id,
+        &raw.resources,
+        AttendeeRole::Resource,
     );
     if !participants.is_empty() {
         event.insert("participants".to_owned(), Value::Object(participants));
@@ -165,6 +171,44 @@ pub fn to_jscalendar(raw: &CalendarItemRaw) -> EventValue {
     if let Some(overrides) = overrides {
         event.insert("recurrenceOverrides".to_owned(), overrides);
     }
+    if raw.reminder_is_set == Some(true) {
+        let minutes = raw.reminder_minutes_before_start.unwrap_or(0).max(0);
+        let offset = if minutes == 0 {
+            "PT0S".to_owned()
+        } else {
+            format!("-PT{minutes}M")
+        };
+        let alert = json!({
+            "@type": "Alert",
+            "trigger": {"@type": "OffsetTrigger", "offset": offset, "relativeTo": "start"},
+            "action": "display",
+        });
+        event.insert(
+            "alerts".to_owned(),
+            Value::Object(map_singleton("1", alert)),
+        );
+    }
+    if let Some(url) = raw
+        .join_online_meeting_url
+        .as_deref()
+        .or(raw.net_show_url.as_deref())
+        .or(raw.meeting_workspace_url.as_deref())
+        .filter(|s| !s.is_empty())
+    {
+        let mut vl = Map::new();
+        vl.insert(
+            "@type".to_owned(),
+            Value::String("VirtualLocation".to_owned()),
+        );
+        vl.insert("uri".to_owned(), Value::String(url.to_owned()));
+        if raw.is_online_meeting == Some(true) {
+            vl.insert("features".to_owned(), json!({"video": true}));
+        }
+        event.insert(
+            "virtualLocations".to_owned(),
+            Value::Object(map_singleton("1", Value::Object(vl))),
+        );
+    }
     EventValue {
         data: Value::Object(event),
         is_draft: false,
@@ -172,46 +216,79 @@ pub fn to_jscalendar(raw: &CalendarItemRaw) -> EventValue {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AttendeeRole {
+    Required,
+    Optional,
+    Resource,
+}
+
 fn add_attendees(
     out: &mut Map<String, Value>,
     next_id: &mut u32,
     attendees: &[RawAttendee],
-    required: bool,
+    role: AttendeeRole,
 ) {
     for att in attendees {
         let key = next_id.to_string();
         *next_id += 1;
         let mut p = Map::new();
         p.insert("@type".to_owned(), Value::String("Participant".to_owned()));
-        if let Some(email) = att.email.as_ref() {
-            p.insert(
-                "calendarAddress".to_owned(),
-                Value::String(format!("mailto:{email}")),
-            );
-            p.insert("email".to_owned(), Value::String(email.clone()));
-        }
         if let Some(name) = att.name.as_ref() {
             p.insert("name".to_owned(), Value::String(name.clone()));
         }
-        let mut roles = Map::new();
-        if required {
-            roles.insert("required".to_owned(), Value::Bool(true));
-        } else {
-            roles.insert("optional".to_owned(), Value::Bool(true));
-        }
-        p.insert("roles".to_owned(), Value::Object(roles));
-        if let Some(rt) = att.response_type.as_ref() {
-            let mapped = match rt.as_str() {
-                "Accept" => "accepted",
-                "Tentative" => "tentative",
-                "Decline" => "declined",
-                "Organizer" => "accepted",
-                _ => "needs-action",
-            };
-            p.insert(
-                "participationStatus".to_owned(),
-                Value::String(mapped.to_owned()),
-            );
+        match att.email.as_ref() {
+            Some(email) => {
+                p.insert(
+                    "calendarAddress".to_owned(),
+                    Value::String(format!("mailto:{email}")),
+                );
+                p.insert("email".to_owned(), Value::String(email.clone()));
+                let mut roles = Map::new();
+                match role {
+                    AttendeeRole::Required | AttendeeRole::Resource => {
+                        roles.insert("required".to_owned(), Value::Bool(true));
+                    }
+                    AttendeeRole::Optional => {
+                        roles.insert("optional".to_owned(), Value::Bool(true));
+                    }
+                }
+                p.insert("roles".to_owned(), Value::Object(roles));
+                if role == AttendeeRole::Resource {
+                    p.insert("kind".to_owned(), Value::String("resource".to_owned()));
+                } else {
+                    p.insert("expectReply".to_owned(), Value::Bool(true));
+                }
+                if let Some(rt) = att.response_type.as_ref() {
+                    let mapped = match rt.as_str() {
+                        "Accept" => "accepted",
+                        "Tentative" => "tentative",
+                        "Decline" => "declined",
+                        "Organizer" => "accepted",
+                        "NoResponseReceived" => "needs-action",
+                        _ => "needs-action",
+                    };
+                    p.insert(
+                        "participationStatus".to_owned(),
+                        Value::String(mapped.to_owned()),
+                    );
+                }
+            }
+            None => {
+                if let Some(rt) = att.response_type.as_ref() {
+                    let mapped = match rt.as_str() {
+                        "Accept" => "accepted",
+                        "Tentative" => "tentative",
+                        "Decline" => "declined",
+                        "Organizer" => "accepted",
+                        _ => "needs-action",
+                    };
+                    p.insert(
+                        "participationStatus".to_owned(),
+                        Value::String(mapped.to_owned()),
+                    );
+                }
+            }
         }
         out.insert(key, Value::Object(p));
     }
@@ -569,6 +646,121 @@ mod tests {
             .find(|p| p["email"] == "eve@x")
             .unwrap();
         assert_eq!(optional["roles"]["optional"], true);
+    }
+
+    #[test]
+    fn reminder_becomes_offset_trigger_alert() {
+        let raw = CalendarItemRaw {
+            uid: Some("uid-alarm".to_owned()),
+            start: Some("2025-06-15T14:00:00Z".to_owned()),
+            end: Some("2025-06-15T15:00:00Z".to_owned()),
+            reminder_is_set: Some(true),
+            reminder_minutes_before_start: Some(15),
+            ..CalendarItemRaw::default()
+        };
+        let v = to_jscalendar(&raw).data;
+        let alert = &v["alerts"]["1"];
+        assert_eq!(alert["@type"], "Alert");
+        assert_eq!(alert["action"], "display");
+        assert_eq!(alert["trigger"]["@type"], "OffsetTrigger");
+        assert_eq!(alert["trigger"]["offset"], "-PT15M");
+        assert_eq!(alert["trigger"]["relativeTo"], "start");
+    }
+
+    #[test]
+    fn reminder_not_set_emits_no_alerts() {
+        let raw = CalendarItemRaw {
+            uid: Some("uid-noalarm".to_owned()),
+            start: Some("2025-06-15T14:00:00Z".to_owned()),
+            end: Some("2025-06-15T15:00:00Z".to_owned()),
+            reminder_is_set: Some(false),
+            reminder_minutes_before_start: Some(15),
+            ..CalendarItemRaw::default()
+        };
+        let v = to_jscalendar(&raw).data;
+        assert!(v.get("alerts").is_none());
+    }
+
+    #[test]
+    fn online_meeting_becomes_virtual_location() {
+        let raw = CalendarItemRaw {
+            uid: Some("uid-online".to_owned()),
+            start: Some("2025-06-15T14:00:00Z".to_owned()),
+            end: Some("2025-06-15T15:00:00Z".to_owned()),
+            is_online_meeting: Some(true),
+            net_show_url: Some("https://teams.example/join/abc".to_owned()),
+            ..CalendarItemRaw::default()
+        };
+        let v = to_jscalendar(&raw).data;
+        let vl = &v["virtualLocations"]["1"];
+        assert_eq!(vl["@type"], "VirtualLocation");
+        assert_eq!(vl["uri"], "https://teams.example/join/abc");
+        assert_eq!(vl["features"]["video"], true);
+    }
+
+    #[test]
+    fn join_url_preferred_over_workspace_url() {
+        let raw = CalendarItemRaw {
+            uid: Some("uid-join".to_owned()),
+            start: Some("2025-06-15T14:00:00Z".to_owned()),
+            end: Some("2025-06-15T15:00:00Z".to_owned()),
+            join_online_meeting_url: Some("https://join/primary".to_owned()),
+            meeting_workspace_url: Some("https://workspace/secondary".to_owned()),
+            ..CalendarItemRaw::default()
+        };
+        let v = to_jscalendar(&raw).data;
+        assert_eq!(v["virtualLocations"]["1"]["uri"], "https://join/primary");
+    }
+
+    #[test]
+    fn resources_get_resource_kind_and_no_expect_reply() {
+        let raw = CalendarItemRaw {
+            uid: Some("uid-res".to_owned()),
+            start: Some("2025-06-15T14:00:00Z".to_owned()),
+            end: Some("2025-06-15T15:00:00Z".to_owned()),
+            resources: vec![crate::exchange_ews::parse::RawAttendee {
+                email: Some("room-7@x".to_owned()),
+                name: Some("Room 7".to_owned()),
+                response_type: Some("Accept".to_owned()),
+            }],
+            ..CalendarItemRaw::default()
+        };
+        let v = to_jscalendar(&raw).data;
+        let res = v["participants"]
+            .as_object()
+            .unwrap()
+            .values()
+            .find(|p| p["email"] == "room-7@x")
+            .unwrap();
+        assert_eq!(res["kind"], "resource");
+        assert_eq!(res["roles"]["required"], true);
+        assert_eq!(res["participationStatus"], "accepted");
+        assert!(res.get("expectReply").is_none());
+    }
+
+    #[test]
+    fn attendees_carry_expect_reply_and_participation_status() {
+        let raw = CalendarItemRaw {
+            uid: Some("uid-rsvp".to_owned()),
+            start: Some("2025-06-15T14:00:00Z".to_owned()),
+            end: Some("2025-06-15T15:00:00Z".to_owned()),
+            required_attendees: vec![crate::exchange_ews::parse::RawAttendee {
+                email: Some("bob@x".to_owned()),
+                name: None,
+                response_type: Some("Tentative".to_owned()),
+            }],
+            ..CalendarItemRaw::default()
+        };
+        let v = to_jscalendar(&raw).data;
+        let bob = v["participants"]
+            .as_object()
+            .unwrap()
+            .values()
+            .find(|p| p["email"] == "bob@x")
+            .unwrap();
+        assert_eq!(bob["expectReply"], true);
+        assert_eq!(bob["participationStatus"], "tentative");
+        assert_eq!(bob["roles"]["required"], true);
     }
 
     #[test]

@@ -16,7 +16,7 @@ use ureq::config::{Config, RedirectAuthHeaders};
 use ureq::tls::{RootCerts, TlsConfig};
 
 use crate::exchange_ews::error::EwsError;
-use crate::exchange_ews::parse::{EnvelopeKind, read_envelope_summary};
+use crate::exchange_ews::parse::{EnvelopeKind, SoapFault, read_envelope_summary};
 use crate::exchange_ews::retry::{FaultDisposition, classify_fault, classify_http_status};
 use crate::exchange_ews::soap::{EnvelopeOptions, soap_action, wrap_envelope};
 use crate::exchange_ews::types::ServerVersion;
@@ -32,6 +32,7 @@ struct Inner {
     auth: Mutex<Auth>,
     impersonated_smtp: Mutex<Option<String>>,
     anchor_mailbox: Mutex<Option<String>>,
+    affinity_cookie: Mutex<Option<String>>,
     retry: RetryPolicy,
     rate_limit: RateLimitState,
     version: Mutex<ServerVersion>,
@@ -71,6 +72,7 @@ impl EwsClient {
                 auth: Mutex::new(auth),
                 impersonated_smtp: Mutex::new(None),
                 anchor_mailbox: Mutex::new(None),
+                affinity_cookie: Mutex::new(None),
                 retry,
                 rate_limit: RateLimitState::new(),
                 version: Mutex::new(ServerVersion::Exchange2013Sp1),
@@ -142,10 +144,9 @@ impl EwsClient {
     }
 
     pub fn call(&self, url: &str, operation: &str, body: &str) -> Result<SoapResponse, EwsError> {
-        let envelope = self.wrap(body);
         let action = soap_action(operation);
         self.inner.soap_calls.fetch_add(1, Ordering::Relaxed);
-        self.execute(url, &envelope, &action)
+        self.execute(url, body, &action)
     }
 
     fn wrap(&self, body: &str) -> String {
@@ -182,22 +183,33 @@ impl EwsClient {
             .and_then(|g| g.clone())
     }
 
+    fn affinity_cookie(&self) -> Option<String> {
+        self.inner
+            .affinity_cookie
+            .lock()
+            .ok()
+            .and_then(|g| g.clone())
+    }
+
     fn execute(&self, url: &str, body: &str, action: &str) -> Result<SoapResponse, EwsError> {
         let logger = self.logger();
         let policy = self.inner.retry;
         let mut attempt: u32 = 0;
         loop {
             self.inner.rate_limit.cooldown().wait();
-            let outcome = self.one_attempt(url, body, action);
+            let sent_version = self.server_version();
+            let envelope = self.wrap(body);
+            let outcome = self.one_attempt(url, &envelope, action);
             match outcome {
                 AttemptOutcome::Ok {
                     status,
                     body: bytes,
                     retry_after,
                 } => {
+                    let summary = read_envelope_summary(&bytes);
                     if (200..300).contains(&status) {
                         self.inner.rate_limit.on_success();
-                        match read_envelope_summary(&bytes) {
+                        match summary {
                             Ok(EnvelopeKind::Body { version }) => {
                                 if let Some(v) = version.to_server_version() {
                                     self.set_server_version(v);
@@ -207,53 +219,22 @@ impl EwsClient {
                                     server_version: version.to_server_version(),
                                 });
                             }
-                            Ok(EnvelopeKind::Fault { fault, version }) => {
-                                if let Some(v) = version.to_server_version() {
-                                    self.set_server_version(v);
-                                }
-                                match classify_fault(&fault.response_code) {
-                                    FaultDisposition::Fatal => {
-                                        return Err(EwsError::SoapFault {
-                                            code: fault.response_code,
-                                            reason: fault.fault_string,
-                                        });
+                            Ok(EnvelopeKind::Fault { fault, .. }) => {
+                                match self.on_fault(
+                                    &fault,
+                                    sent_version,
+                                    action,
+                                    &policy,
+                                    &logger,
+                                    &mut attempt,
+                                ) {
+                                    FaultStep::Fail(e) => return Err(e),
+                                    FaultStep::Sleep(d) => {
+                                        std::thread::sleep(d);
+                                        continue;
                                     }
-                                    FaultDisposition::Auth => {
-                                        return Err(EwsError::Auth(fault.fault_string));
-                                    }
-                                    FaultDisposition::Retryable { delay } => {
-                                        attempt += 1;
-                                        self.inner.retries_total.fetch_add(1, Ordering::Relaxed);
-                                        if attempt > policy.max_retries {
-                                            return Err(EwsError::RetriesExhausted(format!(
-                                                "{operation} kept returning {code}",
-                                                operation = action,
-                                                code = fault.response_code
-                                            )));
-                                        }
-                                        let chosen =
-                                            self.inner.rate_limit.on_throttle(&policy, delay);
-                                        if chosen >= LONG_RETRY_THRESHOLD {
-                                            logger.warn(&format!(
-                                                "EWS soap fault {} ({}); waiting {}s before retry {}/{}",
-                                                fault.response_code,
-                                                fault.fault_string,
-                                                chosen.as_secs(),
-                                                attempt,
-                                                policy.max_retries
-                                            ));
-                                        }
-                                        if logger.enabled(LEVEL_BODIES) {
-                                            eprintln!(
-                                                "retry {}/{} {} after {:?} ({})",
-                                                attempt,
-                                                policy.max_retries,
-                                                action,
-                                                chosen,
-                                                fault.response_code,
-                                            );
-                                        }
-                                        std::thread::sleep(chosen);
+                                    FaultStep::Downgrade(v) => {
+                                        self.set_server_version(v);
                                         continue;
                                     }
                                 }
@@ -261,9 +242,38 @@ impl EwsClient {
                             Err(e) => return Err(e),
                         }
                     }
+                    if status != 401
+                        && status != 403
+                        && let Ok(EnvelopeKind::Fault { fault, .. }) = summary
+                    {
+                        match self.on_fault(
+                            &fault,
+                            sent_version,
+                            action,
+                            &policy,
+                            &logger,
+                            &mut attempt,
+                        ) {
+                            FaultStep::Fail(e) => return Err(e),
+                            FaultStep::Sleep(d) => {
+                                std::thread::sleep(d);
+                                continue;
+                            }
+                            FaultStep::Downgrade(v) => {
+                                self.set_server_version(v);
+                                continue;
+                            }
+                        }
+                    }
                     if status == 401 {
                         return Err(EwsError::Auth(format!(
                             "server returned 401: {}",
+                            truncate(&bytes)
+                        )));
+                    }
+                    if status == 456 {
+                        return Err(EwsError::Auth(format!(
+                            "account is locked (http 456); an administrator must unlock it: {}",
                             truncate(&bytes)
                         )));
                     }
@@ -331,6 +341,71 @@ impl EwsClient {
         }
     }
 
+    fn on_fault(
+        &self,
+        fault: &SoapFault,
+        sent_version: ServerVersion,
+        action: &str,
+        policy: &RetryPolicy,
+        logger: &Logger,
+        attempt: &mut u32,
+    ) -> FaultStep {
+        match classify_fault(&fault.response_code) {
+            FaultDisposition::Fatal => FaultStep::Fail(EwsError::SoapFault {
+                code: fault.response_code.clone(),
+                reason: fault.fault_string.clone(),
+            }),
+            FaultDisposition::Auth => FaultStep::Fail(EwsError::Auth(fault.fault_string.clone())),
+            FaultDisposition::VersionError => match sent_version.lower() {
+                Some(next) => {
+                    logger.warn(&format!(
+                        "EWS rejected schema version {} ({}); retrying as {}",
+                        sent_version.as_str(),
+                        fault.response_code,
+                        next.as_str()
+                    ));
+                    FaultStep::Downgrade(next)
+                }
+                None => FaultStep::Fail(EwsError::SoapFault {
+                    code: fault.response_code.clone(),
+                    reason: format!(
+                        "server rejected every supported EWS schema version (last tried {}): {}",
+                        sent_version.as_str(),
+                        fault.fault_string
+                    ),
+                }),
+            },
+            FaultDisposition::Retryable { delay } => {
+                *attempt += 1;
+                self.inner.retries_total.fetch_add(1, Ordering::Relaxed);
+                if *attempt > policy.max_retries {
+                    return FaultStep::Fail(EwsError::RetriesExhausted(format!(
+                        "{action} kept returning {code}",
+                        code = fault.response_code
+                    )));
+                }
+                let chosen = self.inner.rate_limit.on_throttle(policy, delay);
+                if chosen >= LONG_RETRY_THRESHOLD {
+                    logger.warn(&format!(
+                        "EWS soap fault {} ({}); waiting {}s before retry {}/{}",
+                        fault.response_code,
+                        fault.fault_string,
+                        chosen.as_secs(),
+                        *attempt,
+                        policy.max_retries
+                    ));
+                }
+                if logger.enabled(LEVEL_BODIES) {
+                    eprintln!(
+                        "retry {}/{} {} after {:?} ({})",
+                        *attempt, policy.max_retries, action, chosen, fault.response_code,
+                    );
+                }
+                FaultStep::Sleep(chosen)
+            }
+        }
+    }
+
     fn one_attempt(&self, url: &str, body: &str, action: &str) -> AttemptOutcome {
         let mut req = self
             .inner
@@ -341,9 +416,13 @@ impl EwsClient {
             .header("Accept", "text/xml, application/soap+xml, application/xml")
             .header("Accept-Encoding", "gzip")
             .header("SOAPAction", action.to_owned())
-            .header("User-Agent", self.inner.user_agent.as_str());
+            .header("User-Agent", self.inner.user_agent.as_str())
+            .header("X-PreferServerAffinity", "True");
         if let Some(anchor) = self.anchor_header() {
             req = req.header("X-AnchorMailbox", anchor);
+        }
+        if let Some(cookie) = self.affinity_cookie() {
+            req = req.header("X-BackEndOverrideCookie", cookie);
         }
         let result = req.send(body.as_bytes());
         match result {
@@ -354,6 +433,11 @@ impl EwsClient {
                     .get("retry-after")
                     .and_then(|v| v.to_str().ok())
                     .and_then(retry_after_header);
+                if let Some(cookie) = extract_affinity_cookie(resp.headers())
+                    && let Ok(mut g) = self.inner.affinity_cookie.lock()
+                {
+                    *g = Some(cookie);
+                }
                 match resp.body_mut().with_config().limit(MAX_BODY).read_to_vec() {
                     Ok(bytes) => AttemptOutcome::Ok {
                         status,
@@ -377,6 +461,25 @@ enum AttemptOutcome {
         retry_after: Option<Duration>,
     },
     Transport(EwsError),
+}
+
+enum FaultStep {
+    Fail(EwsError),
+    Sleep(Duration),
+    Downgrade(ServerVersion),
+}
+
+fn extract_affinity_cookie(headers: &ureq::http::HeaderMap) -> Option<String> {
+    for value in headers.get_all("set-cookie") {
+        let Ok(s) = value.to_str() else { continue };
+        if let Some(rest) = s.trim_start().strip_prefix("X-BackEndOverrideCookie=") {
+            let val = rest.split(';').next().unwrap_or(rest).trim();
+            if !val.is_empty() {
+                return Some(val.to_owned());
+            }
+        }
+    }
+    None
 }
 
 fn map_ureq_error(err: ureq::Error) -> EwsError {

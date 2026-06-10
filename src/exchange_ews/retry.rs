@@ -20,6 +20,7 @@ pub fn classify_http_status(status: u16) -> Disposition {
 pub enum FaultDisposition {
     Fatal,
     Auth,
+    VersionError,
     Retryable { delay: Option<Duration> },
 }
 
@@ -35,6 +36,10 @@ pub fn classify_fault(code: &ResponseCode) -> FaultDisposition {
         | ResponseCode::AdUnavailable
         | ResponseCode::BatchProcessingStopped => FaultDisposition::Retryable { delay: None },
         ResponseCode::AuthenticationRequired => FaultDisposition::Auth,
+        ResponseCode::InvalidServerVersion
+        | ResponseCode::IncorrectSchemaVersion
+        | ResponseCode::InvalidRequest
+        | ResponseCode::InvalidSchemaVersionForMailboxVersion => FaultDisposition::VersionError,
         _ => FaultDisposition::Fatal,
     }
 }
@@ -65,6 +70,10 @@ pub fn classify_item_response(code: &ResponseCode) -> ItemAction {
         | ResponseCode::MimeContentConversionFailed
         | ResponseCode::ImpersonationFailed => ItemAction::Skip,
         ResponseCode::AuthenticationRequired => ItemAction::Skip,
+        ResponseCode::InvalidServerVersion
+        | ResponseCode::IncorrectSchemaVersion
+        | ResponseCode::InvalidRequest
+        | ResponseCode::InvalidSchemaVersionForMailboxVersion => ItemAction::Skip,
         ResponseCode::Other(_) => ItemAction::Skip,
     }
 }
@@ -120,6 +129,21 @@ mod tests {
         assert_eq!(classify_http_status(503), Disposition::Retryable);
         assert_eq!(classify_http_status(500), Disposition::Fatal);
         assert_eq!(classify_http_status(401), Disposition::Fatal);
+    }
+
+    #[test]
+    fn schema_version_codes_request_a_downgrade() {
+        for code in [
+            ResponseCode::InvalidServerVersion,
+            ResponseCode::IncorrectSchemaVersion,
+            ResponseCode::InvalidRequest,
+            ResponseCode::InvalidSchemaVersionForMailboxVersion,
+        ] {
+            assert!(matches!(
+                classify_fault(&code),
+                FaultDisposition::VersionError
+            ));
+        }
     }
 
     #[test]

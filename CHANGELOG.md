@@ -10,6 +10,7 @@ All notable changes to this project will be documented in this file. This projec
 
 ### Fixed
 - IMAP: Import fails with `BAD` on servers that advertise `LIST-EXTENDED` without `SPECIAL-USE`.
+- MS Exchange EWS: add support for version negotiation and other enhancements (#6).
 
 ## [1.0.1] - 2026-06-04
 
@@ -18,7 +19,7 @@ All notable changes to this project will be documented in this file. This projec
 ### Changed
 
 ### Fixed
-- MS Exchange duplicate ids and incorrect JSCalendar mapping issues.
+- MS Exchange Graph: duplicate ids and incorrect JSCalendar mapping issues.
 
 ## [1.0.0] - 2026-05-29
 

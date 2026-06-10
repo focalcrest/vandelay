@@ -1031,6 +1031,13 @@ pub struct CalendarItemRaw {
     pub organizer_name: Option<String>,
     pub required_attendees: Vec<RawAttendee>,
     pub optional_attendees: Vec<RawAttendee>,
+    pub resources: Vec<RawAttendee>,
+    pub reminder_is_set: Option<bool>,
+    pub reminder_minutes_before_start: Option<i64>,
+    pub is_online_meeting: Option<bool>,
+    pub join_online_meeting_url: Option<String>,
+    pub net_show_url: Option<String>,
+    pub meeting_workspace_url: Option<String>,
     pub categories: Vec<String>,
     pub created: Option<String>,
     pub last_modified: Option<String>,
@@ -1270,6 +1277,20 @@ pub fn parse_calendar_item(inner_xml: &str) -> Result<CalendarItemRaw, EwsError>
                     attendee_kind = Some("required");
                 } else if local.eq_ignore_ascii_case(b"OptionalAttendees") {
                     attendee_kind = Some("optional");
+                } else if local.eq_ignore_ascii_case(b"Resources") {
+                    attendee_kind = Some("resource");
+                } else if local.eq_ignore_ascii_case(b"ReminderIsSet") {
+                    text_target = Some("reminderIsSet");
+                } else if local.eq_ignore_ascii_case(b"ReminderMinutesBeforeStart") {
+                    text_target = Some("reminderMinutes");
+                } else if local.eq_ignore_ascii_case(b"IsOnlineMeeting") {
+                    text_target = Some("isOnlineMeeting");
+                } else if local.eq_ignore_ascii_case(b"JoinOnlineMeetingUrl") {
+                    text_target = Some("joinUrl");
+                } else if local.eq_ignore_ascii_case(b"NetShowUrl") {
+                    text_target = Some("netShowUrl");
+                } else if local.eq_ignore_ascii_case(b"MeetingWorkspaceUrl") {
+                    text_target = Some("workspaceUrl");
                 } else if local.eq_ignore_ascii_case(b"Attendee") && attendee_kind.is_some() {
                     current_attendee = Some(RawAttendee::default());
                 } else if local.eq_ignore_ascii_case(b"Mailbox") {
@@ -1347,11 +1368,14 @@ pub fn parse_calendar_item(inner_xml: &str) -> Result<CalendarItemRaw, EwsError>
                             match attendee_kind {
                                 Some("required") => item.required_attendees.push(att),
                                 Some("optional") => item.optional_attendees.push(att),
+                                Some("resource") => item.resources.push(att),
                                 _ => {}
                             }
                         }
                     }
-                    b"requiredattendees" | b"optionalattendees" => attendee_kind = None,
+                    b"requiredattendees" | b"optionalattendees" | b"resources" => {
+                        attendee_kind = None
+                    }
                     b"organizer" => in_organizer = false,
                     b"mailbox" => in_mailbox = false,
                     b"categories" => category_collecting = false,
@@ -1423,6 +1447,18 @@ pub fn parse_calendar_item(inner_xml: &str) -> Result<CalendarItemRaw, EwsError>
                             att.response_type = Some(text);
                         }
                     }
+                    Some("reminderIsSet") => {
+                        item.reminder_is_set = Some(matches!(text.trim(), "true" | "1"));
+                    }
+                    Some("reminderMinutes") => {
+                        item.reminder_minutes_before_start = text.trim().parse().ok();
+                    }
+                    Some("isOnlineMeeting") => {
+                        item.is_online_meeting = Some(matches!(text.trim(), "true" | "1"));
+                    }
+                    Some("joinUrl") => item.join_online_meeting_url = Some(text),
+                    Some("netShowUrl") => item.net_show_url = Some(text),
+                    Some("workspaceUrl") => item.meeting_workspace_url = Some(text),
                     Some("category") => item.categories.push(text),
                     Some("created") => item.created = Some(text),
                     Some("lastModified") => item.last_modified = Some(text),
@@ -1558,6 +1594,14 @@ pub struct ContactItemRaw {
     pub created: Option<String>,
     pub last_modified: Option<String>,
     pub attachments: Vec<RawAttachmentRef>,
+    pub is_group: bool,
+    pub members: Vec<RawGroupMember>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct RawGroupMember {
+    pub name: Option<String>,
+    pub email: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1584,6 +1628,9 @@ pub fn parse_contact_item(inner_xml: &str) -> Result<ContactItemRaw, EwsError> {
     let mut current_address: Option<RawContactAddress> = None;
     let mut address_text: Option<&'static str> = None;
     let mut seen_root_contact = false;
+    let mut in_members = false;
+    let mut member_mailbox = false;
+    let mut current_member: Option<RawGroupMember> = None;
     loop {
         buf.clear();
         let (ns, ev) = xml.read_resolved_event_into(&mut buf)?;
@@ -1592,8 +1639,14 @@ pub fn parse_contact_item(inner_xml: &str) -> Result<ContactItemRaw, EwsError> {
             Event::Start(ref e) | Event::Empty(ref e) => {
                 let local = e.local_name().as_ref().to_vec();
                 let is_empty = matches!(ev, Event::Empty(_));
-                if !seen_root_contact && local.eq_ignore_ascii_case(b"Contact") {
+                if !seen_root_contact
+                    && (local.eq_ignore_ascii_case(b"Contact")
+                        || local.eq_ignore_ascii_case(b"DistributionList"))
+                {
                     seen_root_contact = true;
+                    if local.eq_ignore_ascii_case(b"DistributionList") {
+                        item.is_group = true;
+                    }
                     continue;
                 }
                 if ns_kind != Ns::Types {
@@ -1646,6 +1699,16 @@ pub fn parse_contact_item(inner_xml: &str) -> Result<ContactItemRaw, EwsError> {
                     text_target = Some("profession");
                 } else if local.eq_ignore_ascii_case(b"PostalAddressIndex") {
                     text_target = Some("postalAddressIndex");
+                } else if local.eq_ignore_ascii_case(b"Members") {
+                    in_members = true;
+                } else if in_members && local.eq_ignore_ascii_case(b"Member") {
+                    current_member = Some(RawGroupMember::default());
+                } else if in_members && local.eq_ignore_ascii_case(b"Mailbox") {
+                    member_mailbox = true;
+                } else if member_mailbox && local.eq_ignore_ascii_case(b"Name") {
+                    text_target = Some("memberName");
+                } else if member_mailbox && local.eq_ignore_ascii_case(b"EmailAddress") {
+                    text_target = Some("memberEmail");
                 } else if local.eq_ignore_ascii_case(b"Body") {
                     text_target = Some("notes");
                 } else if local.eq_ignore_ascii_case(b"DateTimeCreated") {
@@ -1728,6 +1791,15 @@ pub fn parse_contact_item(inner_xml: &str) -> Result<ContactItemRaw, EwsError> {
                     b"street" | b"city" | b"state" | b"countryorregion" | b"postalcode" => {
                         address_text = None;
                     }
+                    b"members" => in_members = false,
+                    b"mailbox" => member_mailbox = false,
+                    b"member" => {
+                        if let Some(m) = current_member.take()
+                            && (m.email.is_some() || m.name.is_some())
+                        {
+                            item.members.push(m);
+                        }
+                    }
                     _ => {}
                 }
                 text_target = None;
@@ -1775,6 +1847,16 @@ pub fn parse_contact_item(inner_xml: &str) -> Result<ContactItemRaw, EwsError> {
                     Some("notes") => item.notes = Some(text),
                     Some("created") => item.created = Some(text),
                     Some("lastModified") => item.last_modified = Some(text),
+                    Some("memberName") => {
+                        if let Some(m) = current_member.as_mut() {
+                            m.name = Some(text);
+                        }
+                    }
+                    Some("memberEmail") => {
+                        if let Some(m) = current_member.as_mut() {
+                            m.email = Some(text);
+                        }
+                    }
                     Some("category") => item.categories.push(text),
                     Some("child") => item.children.push(text),
                     Some("company") => item.companies.push(text),
@@ -2160,6 +2242,59 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn calendar_parses_reminder_resources_and_online_meeting() {
+        let body = format!(
+            "<t:CalendarItem{NS}>\
+             <t:ItemId Id=\"C1\" ChangeKey=\"K1\"/>\
+             <t:Subject>Standup</t:Subject>\
+             <t:UID>uid-r</t:UID>\
+             <t:ReminderIsSet>true</t:ReminderIsSet>\
+             <t:ReminderMinutesBeforeStart>10</t:ReminderMinutesBeforeStart>\
+             <t:Start>2025-06-15T14:00:00Z</t:Start>\
+             <t:End>2025-06-15T15:00:00Z</t:End>\
+             <t:IsOnlineMeeting>true</t:IsOnlineMeeting>\
+             <t:NetShowUrl>https://meet/abc</t:NetShowUrl>\
+             <t:RequiredAttendees>\
+               <t:Attendee><t:Mailbox><t:Name>Bob</t:Name><t:EmailAddress>bob@x</t:EmailAddress></t:Mailbox><t:ResponseType>Accept</t:ResponseType></t:Attendee>\
+             </t:RequiredAttendees>\
+             <t:Resources>\
+               <t:Attendee><t:Mailbox><t:Name>Room 7</t:Name><t:EmailAddress>room7@x</t:EmailAddress></t:Mailbox></t:Attendee>\
+             </t:Resources>\
+             </t:CalendarItem>"
+        );
+        let parsed = parse_calendar_item(&body).unwrap();
+        assert_eq!(parsed.reminder_is_set, Some(true));
+        assert_eq!(parsed.reminder_minutes_before_start, Some(10));
+        assert_eq!(parsed.is_online_meeting, Some(true));
+        assert_eq!(parsed.net_show_url.as_deref(), Some("https://meet/abc"));
+        assert_eq!(parsed.required_attendees.len(), 1);
+        assert_eq!(parsed.required_attendees[0].email.as_deref(), Some("bob@x"));
+        assert_eq!(parsed.resources.len(), 1);
+        assert_eq!(parsed.resources[0].email.as_deref(), Some("room7@x"));
+    }
+
+    #[test]
+    fn distribution_list_parses_members() {
+        let body = format!(
+            "<t:DistributionList{NS}>\
+             <t:ItemId Id=\"DL1\" ChangeKey=\"K1\"/>\
+             <t:DisplayName>The Team</t:DisplayName>\
+             <t:Members>\
+               <t:Member><t:Mailbox><t:Name>Bob</t:Name><t:EmailAddress>bob@x</t:EmailAddress></t:Mailbox><t:Status>Normal</t:Status></t:Member>\
+               <t:Member><t:Mailbox><t:Name>Carol</t:Name><t:EmailAddress>carol@x</t:EmailAddress></t:Mailbox></t:Member>\
+             </t:Members>\
+             </t:DistributionList>"
+        );
+        let parsed = parse_contact_item(&body).unwrap();
+        assert!(parsed.is_group);
+        assert_eq!(parsed.id.id, "DL1");
+        assert_eq!(parsed.display_name.as_deref(), Some("The Team"));
+        assert_eq!(parsed.members.len(), 2);
+        assert_eq!(parsed.members[0].email.as_deref(), Some("bob@x"));
+        assert_eq!(parsed.members[1].name.as_deref(), Some("Carol"));
     }
 
     #[test]

@@ -149,6 +149,7 @@ pub fn run(common: CommonConfig, config: EwsImportConfig) -> Result<Summary, Err
         attachment_batch: config.attachment_batch.max(1),
         connections: config.ews_connections.clamp(1, 8),
         use_syncfolderitems: config.use_syncfolderitems,
+        sync_batch: super::items::SYNC_BATCH_MAX,
         logger,
     };
 

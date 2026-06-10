@@ -133,6 +133,19 @@ impl ServerVersion {
             _ => ServerVersion::Exchange2016,
         }
     }
+
+    pub fn lower(self) -> Option<ServerVersion> {
+        match self {
+            ServerVersion::Exchange2019 => Some(ServerVersion::Exchange2016),
+            ServerVersion::Exchange2016 => Some(ServerVersion::Exchange2013Sp1),
+            ServerVersion::Exchange2013Sp1 => Some(ServerVersion::Exchange2013),
+            ServerVersion::Exchange2013 => Some(ServerVersion::Exchange2010Sp2),
+            ServerVersion::Exchange2010Sp2 => Some(ServerVersion::Exchange2010Sp1),
+            ServerVersion::Exchange2010Sp1 => Some(ServerVersion::Exchange2010),
+            ServerVersion::Exchange2010 => Some(ServerVersion::Exchange2007),
+            ServerVersion::Exchange2007 => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -197,6 +210,10 @@ pub enum ResponseCode {
     MailboxStoreUnavailable,
     ConnectionFailed,
     AdUnavailable,
+    InvalidServerVersion,
+    IncorrectSchemaVersion,
+    InvalidRequest,
+    InvalidSchemaVersionForMailboxVersion,
     Other(String),
 }
 
@@ -219,6 +236,12 @@ impl ResponseCode {
             "ErrorMailboxStoreUnavailable" => ResponseCode::MailboxStoreUnavailable,
             "ErrorConnectionFailed" => ResponseCode::ConnectionFailed,
             "ErrorADUnavailable" => ResponseCode::AdUnavailable,
+            "ErrorInvalidServerVersion" => ResponseCode::InvalidServerVersion,
+            "ErrorIncorrectSchemaVersion" => ResponseCode::IncorrectSchemaVersion,
+            "ErrorInvalidRequest" => ResponseCode::InvalidRequest,
+            "ErrorInvalidSchemaVersionForMailboxVersion" => {
+                ResponseCode::InvalidSchemaVersionForMailboxVersion
+            }
             other => ResponseCode::Other(other.to_owned()),
         }
     }
@@ -241,6 +264,12 @@ impl ResponseCode {
             ResponseCode::MailboxStoreUnavailable => "ErrorMailboxStoreUnavailable",
             ResponseCode::ConnectionFailed => "ErrorConnectionFailed",
             ResponseCode::AdUnavailable => "ErrorADUnavailable",
+            ResponseCode::InvalidServerVersion => "ErrorInvalidServerVersion",
+            ResponseCode::IncorrectSchemaVersion => "ErrorIncorrectSchemaVersion",
+            ResponseCode::InvalidRequest => "ErrorInvalidRequest",
+            ResponseCode::InvalidSchemaVersionForMailboxVersion => {
+                "ErrorInvalidSchemaVersionForMailboxVersion"
+            }
             ResponseCode::Other(s) => s.as_str(),
         }
     }
@@ -289,6 +318,30 @@ mod tests {
             ServerVersion::from_build(99, 99),
             ServerVersion::Exchange2019
         );
+    }
+
+    #[test]
+    fn server_version_ladder_descends_to_floor() {
+        let mut v = ServerVersion::Exchange2019;
+        let mut chain = vec![v];
+        while let Some(next) = v.lower() {
+            chain.push(next);
+            v = next;
+        }
+        assert_eq!(
+            chain,
+            vec![
+                ServerVersion::Exchange2019,
+                ServerVersion::Exchange2016,
+                ServerVersion::Exchange2013Sp1,
+                ServerVersion::Exchange2013,
+                ServerVersion::Exchange2010Sp2,
+                ServerVersion::Exchange2010Sp1,
+                ServerVersion::Exchange2010,
+                ServerVersion::Exchange2007,
+            ]
+        );
+        assert_eq!(ServerVersion::Exchange2007.lower(), None);
     }
 
     #[test]

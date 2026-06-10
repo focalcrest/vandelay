@@ -17,6 +17,23 @@ pub fn to_jscontact(raw: &ContactItemRaw) -> Value {
     let mut card = Map::new();
     card.insert("@type".to_owned(), Value::String("Card".to_owned()));
     card.insert("version".to_owned(), Value::String("1.0".to_owned()));
+    if raw.is_group {
+        card.insert("kind".to_owned(), Value::String("group".to_owned()));
+        let mut members = Map::new();
+        for m in &raw.members {
+            let key = match m.email.as_ref() {
+                Some(email) => format!("mailto:{email}"),
+                None => match m.name.as_ref() {
+                    Some(name) => name.clone(),
+                    None => continue,
+                },
+            };
+            members.insert(key, Value::Bool(true));
+        }
+        if !members.is_empty() {
+            card.insert("members".to_owned(), Value::Object(members));
+        }
+    }
     if let Some(full) = raw.display_name.as_ref() {
         let mut name = Map::new();
         name.insert("@type".to_owned(), Value::String("Name".to_owned()));
@@ -409,6 +426,41 @@ mod tests {
         let v = to_jscontact(&raw);
         assert_eq!(v["onlineServices"]["1"]["user"], "alice@msn");
         assert!(v["onlineServices"]["1"].get("service").is_none());
+    }
+
+    #[test]
+    fn distribution_list_becomes_group_card_with_members() {
+        let raw = ContactItemRaw {
+            display_name: Some("The Team".to_owned()),
+            is_group: true,
+            members: vec![
+                crate::exchange_ews::parse::RawGroupMember {
+                    name: Some("Bob".to_owned()),
+                    email: Some("bob@x".to_owned()),
+                },
+                crate::exchange_ews::parse::RawGroupMember {
+                    name: Some("No Email".to_owned()),
+                    email: None,
+                },
+            ],
+            ..ContactItemRaw::default()
+        };
+        let v = to_jscontact(&raw);
+        assert_eq!(v["kind"], "group");
+        assert_eq!(v["name"]["full"], "The Team");
+        assert_eq!(v["members"]["mailto:bob@x"], true);
+        assert_eq!(v["members"]["No Email"], true);
+    }
+
+    #[test]
+    fn individual_contact_has_no_kind_or_members() {
+        let raw = ContactItemRaw {
+            display_name: Some("Alice".to_owned()),
+            ..ContactItemRaw::default()
+        };
+        let v = to_jscontact(&raw);
+        assert!(v.get("kind").is_none());
+        assert!(v.get("members").is_none());
     }
 
     #[test]
