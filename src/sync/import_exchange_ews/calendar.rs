@@ -9,7 +9,7 @@ use serde_json::Value;
 
 use crate::db::exchange_ews_ids;
 use crate::error::Error;
-use crate::exchange_ews::calendar_map::to_jscalendar;
+use crate::exchange_ews::calendar_map::to_jscalendar_with_exceptions;
 use crate::exchange_ews::parse::{CalendarItemRaw, parse_calendar_item};
 use crate::exchange_ews::types::{CalendarItemType, ItemId};
 use crate::exchange_ews::xml::ItemShape;
@@ -19,7 +19,8 @@ use crate::sync::TypeCounts;
 use super::attachments::{fetch_attachments, intern_attachment};
 use super::folders::FolderPlan;
 use super::items::{
-    EnumerationMode, ItemRunCtx, delete_vanished, enumerate_folder, for_each_fetched_item, plan_for,
+    EnumerationMode, ItemRunCtx, delete_vanished, enumerate_folder, for_each_fetched_item,
+    get_items, plan_for,
 };
 
 pub fn reconcile_all(
@@ -176,7 +177,8 @@ fn apply_event(
     existing_local_id: Option<i64>,
     counts: &mut TypeCounts,
 ) -> Result<(), Error> {
-    let mut built = to_jscalendar(raw);
+    let modified_full = fetch_modified_occurrences(ctx, raw);
+    let mut built = to_jscalendar_with_exceptions(raw, &modified_full);
     attach_calendar_links(conn, ctx, raw, &mut built.data)?;
     let calendar_ids = serde_json::json!([local_folder_id]).to_string();
     let data = built.data.to_string();
@@ -227,6 +229,33 @@ fn apply_event(
     }
     tx.commit().map_err(|e| Error::Partial(e.to_string()))?;
     Ok(())
+}
+
+fn fetch_modified_occurrences(ctx: &ItemRunCtx<'_>, raw: &CalendarItemRaw) -> Vec<CalendarItemRaw> {
+    let ids: Vec<ItemId> = raw
+        .modified_occurrences
+        .iter()
+        .filter(|o| !o.item_id.id.is_empty())
+        .map(|o| o.item_id.clone())
+        .collect();
+    if ids.is_empty() {
+        return Vec::new();
+    }
+    match get_items(ctx, ItemShape::CalendarItem, &ids) {
+        Ok(outcome) => outcome
+            .messages
+            .iter()
+            .filter(|m| m.success)
+            .filter_map(|m| parse_calendar_item(&m.inner_xml).ok())
+            .filter(|occ| !occ.id.id.is_empty())
+            .collect(),
+        Err(e) => {
+            ctx.logger.warn(&format!(
+                "GetItem (calendar exceptions) failed: {e}; overrides keep time-only changes"
+            ));
+            Vec::new()
+        }
+    }
 }
 
 fn attach_calendar_links(

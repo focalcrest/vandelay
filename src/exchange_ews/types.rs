@@ -373,6 +373,28 @@ mod tests {
     }
 
     #[test]
+    fn server_version_from_build_exchange_2010_family() {
+        assert_eq!(
+            ServerVersion::from_build(14, 0),
+            ServerVersion::Exchange2010
+        );
+        assert_eq!(
+            ServerVersion::from_build(14, 1),
+            ServerVersion::Exchange2010Sp1
+        );
+        assert_eq!(
+            ServerVersion::from_build(14, 2),
+            ServerVersion::Exchange2010Sp2,
+            "AWS WorkMail reports MajorVersion=14 MinorVersion=2 (Exchange2010_SP2)"
+        );
+        assert_eq!(
+            ServerVersion::from_build(14, 3),
+            ServerVersion::Exchange2010Sp2
+        );
+        assert_eq!(ServerVersion::from_build(8, 3), ServerVersion::Exchange2007);
+    }
+
+    #[test]
     fn server_version_ladder_descends_to_floor() {
         let mut v = ServerVersion::Exchange2019;
         let mut chain = vec![v];

@@ -13,7 +13,7 @@ use vandelay::exchange_ews::parse::{
     parse_get_attachment_inline, parse_response_messages, parse_sync_folder_items_response,
     read_envelope_summary,
 };
-use vandelay::exchange_ews::types::{FolderId, ItemId, ResponseCode, ServerVersion};
+use vandelay::exchange_ews::types::{FolderClass, FolderId, ItemId, ResponseCode, ServerVersion};
 use vandelay::exchange_ews::xml::{
     FolderRef, ItemShape, Traversal, find_folder_body, find_item_body, get_attachment_body,
     get_item_body, sync_folder_items_body,
@@ -84,6 +84,47 @@ fn find_folder_pagination_and_classification() {
     let inbox = &parsed.folders[0];
     assert_eq!(inbox.folder_id.id, "FMAIL");
     assert_eq!(inbox.folder_class, "IPF.Note");
+}
+
+#[test]
+fn find_folder_classifies_workmail_folder_class_set() {
+    let body = format!(
+        "<m:FindFolderResponse{NS}><m:ResponseMessages><m:FindFolderResponseMessage ResponseClass=\"Success\">\
+         <m:ResponseCode>NoError</m:ResponseCode>\
+         <m:RootFolder TotalItemsInView=\"7\" IncludesLastItemInRange=\"true\"><t:Folders>\
+         <t:Folder><t:FolderId Id=\"INBOX\"/><t:FolderClass>IPF.Note</t:FolderClass><t:DisplayName>Inbox</t:DisplayName></t:Folder>\
+         <t:Folder><t:FolderId Id=\"CUSTOM\"/><t:DisplayName>SyncFolder</t:DisplayName></t:Folder>\
+         <t:Folder><t:FolderId Id=\"RSS\"/><t:FolderClass>IPF.Note.OutlookHomepage</t:FolderClass><t:DisplayName>RSS Feeds</t:DisplayName></t:Folder>\
+         <t:Folder><t:FolderId Id=\"CFG\"/><t:FolderClass>IPF.Configuration</t:FolderClass><t:DisplayName>Quick Step Settings</t:DisplayName></t:Folder>\
+         <t:TasksFolder><t:FolderId Id=\"TASKS\"/><t:FolderClass>IPF.Task</t:FolderClass><t:DisplayName>Tasks</t:DisplayName></t:TasksFolder>\
+         <t:CalendarFolder><t:FolderId Id=\"CAL\"/><t:FolderClass>IPF.Appointment</t:FolderClass><t:DisplayName>Calendar</t:DisplayName></t:CalendarFolder>\
+         <t:ContactsFolder><t:FolderId Id=\"CON\"/><t:FolderClass>IPF.Contact</t:FolderClass><t:DisplayName>Contacts</t:DisplayName></t:ContactsFolder>\
+         </t:Folders></m:RootFolder></m:FindFolderResponseMessage></m:ResponseMessages></m:FindFolderResponse>"
+    );
+    let parsed = parse_find_folder_response(envelope(&body).as_bytes()).unwrap();
+    let by_id = |id: &str| {
+        parsed
+            .folders
+            .iter()
+            .find(|f| f.folder_id.id == id)
+            .map(|f| FolderClass::from_ipf(&f.folder_class))
+            .unwrap()
+    };
+    assert_eq!(by_id("INBOX"), FolderClass::Mail);
+    assert_eq!(
+        by_id("CUSTOM"),
+        FolderClass::Mail,
+        "a user folder with no FolderClass must import as mail, never be dropped"
+    );
+    assert_eq!(
+        by_id("RSS"),
+        FolderClass::Skipped,
+        "RSS Feeds (IPF.Note.OutlookHomepage) holds feed posts, not mail"
+    );
+    assert_eq!(by_id("CFG"), FolderClass::Skipped);
+    assert_eq!(by_id("TASKS"), FolderClass::Skipped);
+    assert_eq!(by_id("CAL"), FolderClass::Calendar);
+    assert_eq!(by_id("CON"), FolderClass::Contacts);
 }
 
 #[test]

@@ -269,3 +269,39 @@ fn keyword_array(item: &MessageItem) -> String {
     let value: Value = Value::Array(kws.into_iter().map(Value::String).collect());
     value.to_string()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::keyword_array;
+    use crate::exchange_ews::parse::MessageItem;
+
+    #[test]
+    fn read_draft_flagged_and_categories_map_to_jmap_keywords() {
+        let item = MessageItem {
+            is_read: Some(true),
+            is_draft: Some(true),
+            flag_status: Some("Flagged".to_owned()),
+            categories: vec!["Red Category".to_owned(), "VIP".to_owned()],
+            ..MessageItem::default()
+        };
+        let kws = keyword_array(&item);
+        for expected in ["$seen", "$draft", "$flagged", "red category", "vip"] {
+            assert!(kws.contains(expected), "missing {expected} in {kws}");
+        }
+    }
+
+    #[test]
+    fn unread_unflagged_message_has_no_seen_or_flagged() {
+        let item = MessageItem {
+            is_read: Some(false),
+            flag_status: Some("NotFlagged".to_owned()),
+            ..MessageItem::default()
+        };
+        let kws = keyword_array(&item);
+        assert!(!kws.contains("$seen"), "unread must not be $seen: {kws}");
+        assert!(
+            !kws.contains("$flagged"),
+            "only FlagStatus=Flagged maps to $flagged: {kws}"
+        );
+    }
+}

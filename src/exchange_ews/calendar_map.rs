@@ -17,6 +17,30 @@ pub struct EventValue {
 }
 
 pub fn to_jscalendar(raw: &CalendarItemRaw) -> EventValue {
+    to_jscalendar_with_exceptions(raw, &[])
+}
+
+pub fn to_jscalendar_with_exceptions(
+    raw: &CalendarItemRaw,
+    modified_full: &[CalendarItemRaw],
+) -> EventValue {
+    let iana = raw
+        .start_tz
+        .as_deref()
+        .map(|tz| resolve_to_iana(tz).unwrap_or_else(|| "Etc/UTC".to_owned()));
+    let mut event = build_event_map(raw, iana.as_deref());
+    if let Some(overrides) = build_recurrence_overrides(&event, raw, modified_full, iana.as_deref())
+    {
+        event.insert("recurrenceOverrides".to_owned(), overrides);
+    }
+    EventValue {
+        data: Value::Object(event),
+        is_draft: false,
+        use_default_alerts: false,
+    }
+}
+
+fn build_event_map(raw: &CalendarItemRaw, iana: Option<&str>) -> Map<String, Value> {
     let mut event = Map::new();
     event.insert("@type".to_owned(), Value::String("Event".to_owned()));
     if let Some(uid) = raw.uid.as_ref() {
@@ -57,7 +81,7 @@ pub fn to_jscalendar(raw: &CalendarItemRaw) -> EventValue {
             Value::String(normalise_utc_datetime(created)),
         );
     }
-    if let Some(updated) = raw.last_modified.as_ref() {
+    if let Some(updated) = raw.last_modified.as_ref().or(raw.created.as_ref()) {
         event.insert(
             "updated".to_owned(),
             Value::String(normalise_utc_datetime(updated)),
@@ -70,10 +94,6 @@ pub fn to_jscalendar(raw: &CalendarItemRaw) -> EventValue {
         }
         event.insert("keywords".to_owned(), Value::Object(kw));
     }
-    let iana = raw
-        .start_tz
-        .as_deref()
-        .map(|tz| resolve_to_iana(tz).unwrap_or_else(|| "Etc/UTC".to_owned()));
     if let Some(true) = raw.is_all_day_event {
         if let Some(start) = raw.start.as_ref() {
             let date_only = start.split('T').next().unwrap_or(start.as_str());
@@ -92,7 +112,7 @@ pub fn to_jscalendar(raw: &CalendarItemRaw) -> EventValue {
         if let Some(start) = raw.start.as_ref() {
             event.insert(
                 "start".to_owned(),
-                Value::String(to_local_datetime_in(start, iana.as_deref())),
+                Value::String(to_local_datetime_in(start, iana)),
             );
         }
         if let (Some(start), Some(end)) = (raw.start.as_ref(), raw.end.as_ref())
@@ -100,7 +120,7 @@ pub fn to_jscalendar(raw: &CalendarItemRaw) -> EventValue {
         {
             event.insert("duration".to_owned(), Value::String(dur));
         }
-        if let Some(tz) = iana.as_deref() {
+        if let Some(tz) = iana {
             event.insert("timeZone".to_owned(), Value::String(tz.to_owned()));
         }
     }
@@ -116,10 +136,13 @@ pub fn to_jscalendar(raw: &CalendarItemRaw) -> EventValue {
     }
     let mut participants = Map::new();
     let mut next_id = 1;
-    if let Some(email) = raw.organizer_smtp.as_ref() {
+    if let Some((cal_addr, smtp)) = resolve_calendar_address(
+        raw.organizer_smtp.as_deref(),
+        raw.organizer_routing_type.as_deref(),
+        raw.organizer_name.as_deref(),
+    ) {
         let key = next_id.to_string();
         next_id += 1;
-        let cal_addr = format!("mailto:{email}");
         event.insert(
             "organizerCalendarAddress".to_owned(),
             Value::String(cal_addr.clone()),
@@ -127,7 +150,9 @@ pub fn to_jscalendar(raw: &CalendarItemRaw) -> EventValue {
         let mut p = Map::new();
         p.insert("@type".to_owned(), Value::String("Participant".to_owned()));
         p.insert("calendarAddress".to_owned(), Value::String(cal_addr));
-        p.insert("email".to_owned(), Value::String(email.clone()));
+        if let Some(email) = smtp {
+            p.insert("email".to_owned(), Value::String(email));
+        }
         let mut roles = Map::new();
         roles.insert("owner".to_owned(), Value::Bool(true));
         roles.insert("chair".to_owned(), Value::Bool(true));
@@ -162,14 +187,6 @@ pub fn to_jscalendar(raw: &CalendarItemRaw) -> EventValue {
         && let Some(rule) = to_jscalendar_rule(rec)
     {
         event.insert("recurrenceRule".to_owned(), rule);
-    }
-    let overrides = build_recurrence_overrides(
-        &raw.modified_occurrences,
-        &raw.deleted_occurrences,
-        iana.as_deref(),
-    );
-    if let Some(overrides) = overrides {
-        event.insert("recurrenceOverrides".to_owned(), overrides);
     }
     if raw.reminder_is_set == Some(true) {
         let minutes = raw.reminder_minutes_before_start.unwrap_or(0).max(0);
@@ -209,11 +226,33 @@ pub fn to_jscalendar(raw: &CalendarItemRaw) -> EventValue {
             Value::Object(map_singleton("1", Value::Object(vl))),
         );
     }
-    EventValue {
-        data: Value::Object(event),
-        is_draft: false,
-        use_default_alerts: false,
+    event
+}
+
+fn synthetic_attendee_address(identifier: &str) -> String {
+    format!(
+        "urn:x-vandelay:attendee:{}",
+        blake3::hash(identifier.as_bytes()).to_hex()
+    )
+}
+
+fn is_smtp_routing(routing_type: Option<&str>) -> bool {
+    routing_type.is_none_or(|rt| rt.eq_ignore_ascii_case("SMTP"))
+}
+
+fn resolve_calendar_address(
+    address: Option<&str>,
+    routing_type: Option<&str>,
+    name: Option<&str>,
+) -> Option<(String, Option<String>)> {
+    if let Some(addr) = address.filter(|a| !a.trim().is_empty()) {
+        if is_smtp_routing(routing_type) {
+            return Some((format!("mailto:{addr}"), Some(addr.to_owned())));
+        }
+        return Some((synthetic_attendee_address(addr), None));
     }
+    name.filter(|n| !n.trim().is_empty())
+        .map(|n| (synthetic_attendee_address(n), None))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -237,73 +276,77 @@ fn add_attendees(
         if let Some(name) = att.name.as_ref() {
             p.insert("name".to_owned(), Value::String(name.clone()));
         }
-        match att.email.as_ref() {
-            Some(email) => {
-                p.insert(
-                    "calendarAddress".to_owned(),
-                    Value::String(format!("mailto:{email}")),
-                );
-                p.insert("email".to_owned(), Value::String(email.clone()));
-                let mut roles = Map::new();
-                match role {
-                    AttendeeRole::Required | AttendeeRole::Resource => {
-                        roles.insert("required".to_owned(), Value::Bool(true));
-                    }
-                    AttendeeRole::Optional => {
-                        roles.insert("optional".to_owned(), Value::Bool(true));
-                    }
+        let calendar_address = resolve_calendar_address(
+            att.email.as_deref(),
+            att.routing_type.as_deref(),
+            att.name.as_deref(),
+        );
+        if let Some((addr, smtp)) = calendar_address {
+            p.insert("calendarAddress".to_owned(), Value::String(addr));
+            if let Some(email) = smtp {
+                p.insert("email".to_owned(), Value::String(email));
+            }
+            let mut roles = Map::new();
+            match role {
+                AttendeeRole::Required | AttendeeRole::Resource => {
+                    roles.insert("required".to_owned(), Value::Bool(true));
                 }
-                p.insert("roles".to_owned(), Value::Object(roles));
-                if role == AttendeeRole::Resource {
-                    p.insert("kind".to_owned(), Value::String("resource".to_owned()));
-                } else {
-                    p.insert("expectReply".to_owned(), Value::Bool(true));
-                }
-                if let Some(rt) = att.response_type.as_ref() {
-                    let mapped = match rt.as_str() {
-                        "Accept" => "accepted",
-                        "Tentative" => "tentative",
-                        "Decline" => "declined",
-                        "Organizer" => "accepted",
-                        "NoResponseReceived" => "needs-action",
-                        _ => "needs-action",
-                    };
-                    p.insert(
-                        "participationStatus".to_owned(),
-                        Value::String(mapped.to_owned()),
-                    );
+                AttendeeRole::Optional => {
+                    roles.insert("optional".to_owned(), Value::Bool(true));
                 }
             }
-            None => {
-                if let Some(rt) = att.response_type.as_ref() {
-                    let mapped = match rt.as_str() {
-                        "Accept" => "accepted",
-                        "Tentative" => "tentative",
-                        "Decline" => "declined",
-                        "Organizer" => "accepted",
-                        _ => "needs-action",
-                    };
-                    p.insert(
-                        "participationStatus".to_owned(),
-                        Value::String(mapped.to_owned()),
-                    );
-                }
+            p.insert("roles".to_owned(), Value::Object(roles));
+            if role == AttendeeRole::Resource {
+                p.insert("kind".to_owned(), Value::String("resource".to_owned()));
+            } else {
+                p.insert("expectReply".to_owned(), Value::Bool(true));
+            }
+            if let Some(rt) = att.response_type.as_ref() {
+                let mapped = match rt.as_str() {
+                    "Accept" => "accepted",
+                    "Tentative" => "tentative",
+                    "Decline" => "declined",
+                    "Organizer" => "accepted",
+                    "NoResponseReceived" => "needs-action",
+                    _ => "needs-action",
+                };
+                p.insert(
+                    "participationStatus".to_owned(),
+                    Value::String(mapped.to_owned()),
+                );
             }
         }
         out.insert(key, Value::Object(p));
     }
 }
 
+const OVERRIDE_IGNORED_POINTERS: &[&str] = &[
+    "@type",
+    "uid",
+    "recurrenceRule",
+    "recurrenceOverrides",
+    "recurrenceId",
+    "recurrenceIdTimeZone",
+    "method",
+    "organizerCalendarAddress",
+    "privacy",
+    "prodId",
+    "relatedTo",
+    "created",
+    "updated",
+];
+
 fn build_recurrence_overrides(
-    modified: &[RawOccurrence],
-    deleted: &[RawOccurrence],
+    base_event: &Map<String, Value>,
+    raw: &CalendarItemRaw,
+    modified_full: &[CalendarItemRaw],
     iana: Option<&str>,
 ) -> Option<Value> {
-    if modified.is_empty() && deleted.is_empty() {
+    if raw.modified_occurrences.is_empty() && raw.deleted_occurrences.is_empty() {
         return None;
     }
     let mut map = Map::new();
-    for occ in modified {
+    for occ in &raw.modified_occurrences {
         let Some(key) = occ
             .original_start
             .as_deref()
@@ -312,21 +355,19 @@ fn build_recurrence_overrides(
         else {
             continue;
         };
-        let mut o = Map::new();
-        if let Some(s) = occ.start.as_ref() {
-            o.insert(
-                "start".to_owned(),
-                Value::String(to_local_datetime_in(s, iana)),
-            );
-        }
-        if let (Some(s), Some(e)) = (occ.start.as_ref(), occ.end.as_ref())
-            && let Some(dur) = duration_iso8601(s, e)
-        {
-            o.insert("duration".to_owned(), Value::String(dur));
-        }
-        map.insert(key, Value::Object(o));
+        let full = modified_full
+            .iter()
+            .find(|f| !occ.item_id.id.is_empty() && f.id.id == occ.item_id.id);
+        let patch = match full {
+            Some(full) => {
+                let occ_event = build_event_map(full, iana);
+                override_patch(&occ_event, base_event, &key)
+            }
+            None => time_only_patch(occ, iana),
+        };
+        map.insert(key, Value::Object(patch));
     }
-    for occ in deleted {
+    for occ in &raw.deleted_occurrences {
         let Some(key) = occ.start.as_deref().map(|s| to_local_datetime_in(s, iana)) else {
             continue;
         };
@@ -337,6 +378,53 @@ fn build_recurrence_overrides(
     } else {
         Some(Value::Object(map))
     }
+}
+
+fn override_patch(
+    occ_event: &Map<String, Value>,
+    base_event: &Map<String, Value>,
+    recurrence_id: &str,
+) -> Map<String, Value> {
+    let mut patch = Map::new();
+    let inherited_start = Value::String(recurrence_id.to_owned());
+    for (k, v) in occ_event {
+        if OVERRIDE_IGNORED_POINTERS.contains(&k.as_str()) {
+            continue;
+        }
+        let baseline = if k == "start" {
+            Some(&inherited_start)
+        } else {
+            base_event.get(k)
+        };
+        if baseline != Some(v) {
+            patch.insert(k.clone(), v.clone());
+        }
+    }
+    for k in base_event.keys() {
+        if k == "start" || OVERRIDE_IGNORED_POINTERS.contains(&k.as_str()) {
+            continue;
+        }
+        if !occ_event.contains_key(k) {
+            patch.insert(k.clone(), Value::Null);
+        }
+    }
+    patch
+}
+
+fn time_only_patch(occ: &RawOccurrence, iana: Option<&str>) -> Map<String, Value> {
+    let mut o = Map::new();
+    if let Some(s) = occ.start.as_ref() {
+        o.insert(
+            "start".to_owned(),
+            Value::String(to_local_datetime_in(s, iana)),
+        );
+    }
+    if let (Some(s), Some(e)) = (occ.start.as_ref(), occ.end.as_ref())
+        && let Some(dur) = duration_iso8601(s, e)
+    {
+        o.insert("duration".to_owned(), Value::String(dur));
+    }
+    o
 }
 
 fn normalise_utc_datetime(s: &str) -> String {
@@ -600,6 +688,182 @@ mod tests {
     }
 
     #[test]
+    fn updated_backfills_from_created_when_last_modified_absent() {
+        let raw = CalendarItemRaw {
+            uid: Some("u".to_owned()),
+            start: Some("2025-06-15T14:00:00Z".to_owned()),
+            end: Some("2025-06-15T15:00:00Z".to_owned()),
+            created: Some("2025-06-01T09:00:00Z".to_owned()),
+            last_modified: None,
+            ..CalendarItemRaw::default()
+        };
+        let v = to_jscalendar(&raw).data;
+        assert_eq!(
+            v["updated"], "2025-06-01T09:00:00Z",
+            "updated is mandatory (jscalendarbis 3.1.6); backfill from created"
+        );
+    }
+
+    #[test]
+    fn address_less_attendee_keeps_rsvp_via_synthetic_non_mailto_calendar_address() {
+        let raw = CalendarItemRaw {
+            uid: Some("u".to_owned()),
+            start: Some("2025-06-15T14:00:00Z".to_owned()),
+            end: Some("2025-06-15T15:00:00Z".to_owned()),
+            required_attendees: vec![crate::exchange_ews::parse::RawAttendee {
+                email: None,
+                routing_type: None,
+                name: Some("No Address Person".to_owned()),
+                response_type: Some("Accept".to_owned()),
+            }],
+            ..CalendarItemRaw::default()
+        };
+        let v = to_jscalendar(&raw).data;
+        let p = v["participants"]
+            .as_object()
+            .unwrap()
+            .values()
+            .find(|p| p["name"] == "No Address Person")
+            .unwrap();
+        let addr = p["calendarAddress"].as_str().unwrap();
+        assert!(
+            addr.starts_with("urn:x-vandelay:attendee:"),
+            "a name-only attendee gets a stable synthetic calendarAddress, got {addr}"
+        );
+        assert!(
+            !addr.starts_with("mailto:"),
+            "synthetic address MUST NOT be a mailto: (export must not invite a fabricated address)"
+        );
+        assert_eq!(
+            p["participationStatus"], "accepted",
+            "the RSVP is preserved now that a calendarAddress is present (jscalendarbis 3.4.6)"
+        );
+        assert!(p.get("email").is_none(), "no real email is invented");
+        assert_eq!(p["roles"]["required"], true);
+    }
+
+    #[test]
+    fn synthetic_attendee_address_is_stable_per_name() {
+        assert_eq!(
+            synthetic_attendee_address("Jane Doe"),
+            synthetic_attendee_address("Jane Doe")
+        );
+        assert_ne!(
+            synthetic_attendee_address("Jane Doe"),
+            synthetic_attendee_address("John Doe")
+        );
+    }
+
+    #[test]
+    fn legacy_ex_routing_type_does_not_produce_a_mailto() {
+        let dn = "/o=ExchangeLabs/ou=Exchange Administrative Group/cn=Recipients/cn=abc123";
+        let raw = CalendarItemRaw {
+            uid: Some("u".to_owned()),
+            start: Some("2025-06-15T14:00:00Z".to_owned()),
+            end: Some("2025-06-15T15:00:00Z".to_owned()),
+            organizer_smtp: Some(dn.to_owned()),
+            organizer_routing_type: Some("EX".to_owned()),
+            organizer_name: Some("Legacy Organizer".to_owned()),
+            required_attendees: vec![RawAttendee {
+                email: Some(dn.to_owned()),
+                routing_type: Some("EX".to_owned()),
+                name: Some("Legacy Attendee".to_owned()),
+                response_type: Some("Accept".to_owned()),
+            }],
+            ..CalendarItemRaw::default()
+        };
+        let v = to_jscalendar(&raw).data;
+        let org_addr = v["organizerCalendarAddress"].as_str().unwrap();
+        assert!(
+            org_addr.starts_with("urn:x-vandelay:attendee:") && !org_addr.contains("mailto:"),
+            "an EX organizer must not become mailto:/o=.../cn=...; got {org_addr}"
+        );
+        let att = v["participants"]
+            .as_object()
+            .unwrap()
+            .values()
+            .find(|p| p["name"] == "Legacy Attendee")
+            .unwrap();
+        let att_addr = att["calendarAddress"].as_str().unwrap();
+        assert!(!att_addr.starts_with("mailto:"), "got {att_addr}");
+        assert!(att.get("email").is_none(), "an X500 DN is not an email");
+        assert_eq!(att["participationStatus"], "accepted");
+    }
+
+    #[test]
+    fn smtp_routing_type_still_yields_mailto() {
+        let raw = CalendarItemRaw {
+            uid: Some("u".to_owned()),
+            start: Some("2025-06-15T14:00:00Z".to_owned()),
+            end: Some("2025-06-15T15:00:00Z".to_owned()),
+            required_attendees: vec![RawAttendee {
+                email: Some("bob@example.com".to_owned()),
+                routing_type: Some("SMTP".to_owned()),
+                name: None,
+                response_type: Some("Accept".to_owned()),
+            }],
+            ..CalendarItemRaw::default()
+        };
+        let v = to_jscalendar(&raw).data;
+        let att = v["participants"]
+            .as_object()
+            .unwrap()
+            .values()
+            .next()
+            .unwrap();
+        assert_eq!(att["calendarAddress"], "mailto:bob@example.com");
+        assert_eq!(att["email"], "bob@example.com");
+    }
+
+    #[test]
+    fn modified_occurrence_override_captures_title_and_location_not_just_time() {
+        let master = CalendarItemRaw {
+            uid: Some("uid-series".to_owned()),
+            subject: Some("Standup".to_owned()),
+            start: Some("2025-06-16T14:00:00Z".to_owned()),
+            end: Some("2025-06-16T14:30:00Z".to_owned()),
+            recurrence: Some(crate::exchange_ews::parse::RawRecurrence {
+                pattern: Some(RecurrencePattern::Daily { interval: 1 }),
+                range: Some(RecurrenceRange::Numbered {
+                    start_date: "2025-06-16".to_owned(),
+                    number_of_occurrences: 5,
+                }),
+            }),
+            modified_occurrences: vec![RawOccurrence {
+                item_id: crate::exchange_ews::types::ItemId::new("EXC1", ""),
+                start: Some("2025-06-18T14:00:00Z".to_owned()),
+                end: Some("2025-06-18T14:30:00Z".to_owned()),
+                original_start: Some("2025-06-18T14:00:00Z".to_owned()),
+            }],
+            ..CalendarItemRaw::default()
+        };
+        let full_occ = CalendarItemRaw {
+            id: crate::exchange_ews::types::ItemId::new("EXC1", ""),
+            uid: Some("uid-series".to_owned()),
+            subject: Some("Sprint Retro".to_owned()),
+            location: Some("Big Room".to_owned()),
+            start: Some("2025-06-18T14:00:00Z".to_owned()),
+            end: Some("2025-06-18T14:30:00Z".to_owned()),
+            ..CalendarItemRaw::default()
+        };
+        let v = to_jscalendar_with_exceptions(&master, std::slice::from_ref(&full_occ)).data;
+        let ov = &v["recurrenceOverrides"]["2025-06-18T14:00:00"];
+        assert_eq!(
+            ov["title"], "Sprint Retro",
+            "changed subject must be in the override"
+        );
+        assert_eq!(ov["locations"]["1"]["name"], "Big Room");
+        assert!(
+            ov.get("start").is_none(),
+            "an unchanged occurrence time must not emit a redundant start patch"
+        );
+        assert!(
+            ov.get("uid").is_none() && ov.get("recurrenceRule").is_none(),
+            "ignored pointers must never appear in a PatchObject"
+        );
+    }
+
+    #[test]
     fn multi_day_all_day_spans_correct_number_of_days() {
         let raw = CalendarItemRaw {
             uid: Some("uid-multi".to_owned()),
@@ -622,11 +886,13 @@ mod tests {
             organizer_smtp: Some("alice@x".to_owned()),
             required_attendees: vec![crate::exchange_ews::parse::RawAttendee {
                 email: Some("bob@x".to_owned()),
+                routing_type: None,
                 name: None,
                 response_type: Some("Accept".to_owned()),
             }],
             optional_attendees: vec![crate::exchange_ews::parse::RawAttendee {
                 email: Some("eve@x".to_owned()),
+                routing_type: None,
                 name: None,
                 response_type: None,
             }],
@@ -720,6 +986,7 @@ mod tests {
             end: Some("2025-06-15T15:00:00Z".to_owned()),
             resources: vec![crate::exchange_ews::parse::RawAttendee {
                 email: Some("room-7@x".to_owned()),
+                routing_type: None,
                 name: Some("Room 7".to_owned()),
                 response_type: Some("Accept".to_owned()),
             }],
@@ -746,6 +1013,7 @@ mod tests {
             end: Some("2025-06-15T15:00:00Z".to_owned()),
             required_attendees: vec![crate::exchange_ews::parse::RawAttendee {
                 email: Some("bob@x".to_owned()),
+                routing_type: None,
                 name: None,
                 response_type: Some("Tentative".to_owned()),
             }],

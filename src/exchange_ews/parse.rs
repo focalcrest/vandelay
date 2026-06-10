@@ -1089,6 +1089,7 @@ pub struct CalendarItemRaw {
     pub modified_occurrences: Vec<RawOccurrence>,
     pub deleted_occurrences: Vec<RawOccurrence>,
     pub organizer_smtp: Option<String>,
+    pub organizer_routing_type: Option<String>,
     pub organizer_name: Option<String>,
     pub required_attendees: Vec<RawAttendee>,
     pub optional_attendees: Vec<RawAttendee>,
@@ -1118,6 +1119,7 @@ pub struct RawOccurrence {
 #[derive(Debug, Clone, Default)]
 pub struct RawAttendee {
     pub email: Option<String>,
+    pub routing_type: Option<String>,
     pub name: Option<String>,
     pub response_type: Option<String>,
 }
@@ -1370,6 +1372,12 @@ pub fn parse_calendar_item(inner_xml: &str) -> Result<CalendarItemRaw, EwsError>
                     } else {
                         "attendeeEmail"
                     });
+                } else if local.eq_ignore_ascii_case(b"RoutingType") && in_mailbox {
+                    text_target = Some(if in_organizer {
+                        "organizerRouting"
+                    } else {
+                        "attendeeRouting"
+                    });
                 } else if local.eq_ignore_ascii_case(b"ResponseType") && current_attendee.is_some()
                 {
                     text_target = Some("attendeeResponse");
@@ -1432,6 +1440,7 @@ pub fn parse_calendar_item(inner_xml: &str) -> Result<CalendarItemRaw, EwsError>
                         "recurrenceId" => item.recurrence_id = Some(text),
                         "organizerName" => item.organizer_name = Some(text),
                         "organizerEmail" => item.organizer_smtp = Some(text),
+                        "organizerRouting" => item.organizer_routing_type = Some(text),
                         "attendeeName" => {
                             if let Some(att) = current_attendee.as_mut() {
                                 att.name = Some(text);
@@ -1440,6 +1449,11 @@ pub fn parse_calendar_item(inner_xml: &str) -> Result<CalendarItemRaw, EwsError>
                         "attendeeEmail" => {
                             if let Some(att) = current_attendee.as_mut() {
                                 att.email = Some(text);
+                            }
+                        }
+                        "attendeeRouting" => {
+                            if let Some(att) = current_attendee.as_mut() {
+                                att.routing_type = Some(text);
                             }
                         }
                         "attendeeResponse" => {
@@ -2403,6 +2417,104 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn end_date_recurrence_wire_shape_with_trailing_z_yields_clean_until() {
+        let body = format!(
+            "<t:CalendarItem{NS}><t:ItemId Id=\"M\" ChangeKey=\"K\"/>\
+             <t:Subject>RecDailyEnd</t:Subject><t:UID>u</t:UID>\
+             <t:Start>2026-07-01T15:00:00Z</t:Start><t:End>2026-07-01T15:30:00Z</t:End>\
+             <t:CalendarItemType>RecurringMaster</t:CalendarItemType>\
+             <t:Recurrence>\
+               <t:DailyRecurrence><t:Interval>2</t:Interval></t:DailyRecurrence>\
+               <t:EndDateRecurrence><t:StartDate>2026-07-01Z</t:StartDate><t:EndDate>2026-08-01Z</t:EndDate></t:EndDateRecurrence>\
+             </t:Recurrence></t:CalendarItem>"
+        );
+        let parsed = parse_calendar_item(&body).unwrap();
+        let rule = crate::exchange_ews::recurrence::to_jscalendar_rule(
+            parsed.recurrence.as_ref().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(rule["frequency"], "daily");
+        assert_eq!(rule["interval"], 2);
+        assert_eq!(
+            rule["until"], "2026-08-01T23:59:59",
+            "trailing Z on EndDate must be stripped, not embedded mid-string"
+        );
+    }
+
+    #[test]
+    fn absolute_and_relative_recurrence_wire_shapes_round_trip() {
+        let cases = [
+            (
+                "<t:AbsoluteMonthlyRecurrence><t:Interval>1</t:Interval><t:DayOfMonth>15</t:DayOfMonth></t:AbsoluteMonthlyRecurrence><t:NoEndRecurrence><t:StartDate>2026-07-01Z</t:StartDate></t:NoEndRecurrence>",
+                "monthly",
+            ),
+            (
+                "<t:RelativeMonthlyRecurrence><t:Interval>1</t:Interval><t:DaysOfWeek>Friday</t:DaysOfWeek><t:DayOfWeekIndex>Last</t:DayOfWeekIndex></t:RelativeMonthlyRecurrence><t:NoEndRecurrence><t:StartDate>2026-07-01Z</t:StartDate></t:NoEndRecurrence>",
+                "monthly",
+            ),
+            (
+                "<t:AbsoluteYearlyRecurrence><t:DayOfMonth>1</t:DayOfMonth><t:Month>January</t:Month></t:AbsoluteYearlyRecurrence><t:NoEndRecurrence><t:StartDate>2026-07-01Z</t:StartDate></t:NoEndRecurrence>",
+                "yearly",
+            ),
+            (
+                "<t:RelativeYearlyRecurrence><t:DaysOfWeek>Monday</t:DaysOfWeek><t:DayOfWeekIndex>First</t:DayOfWeekIndex><t:Month>September</t:Month></t:RelativeYearlyRecurrence><t:NoEndRecurrence><t:StartDate>2026-07-01Z</t:StartDate></t:NoEndRecurrence>",
+                "yearly",
+            ),
+        ];
+        for (rec_xml, freq) in cases {
+            let body = format!(
+                "<t:CalendarItem{NS}><t:ItemId Id=\"M\" ChangeKey=\"K\"/><t:UID>u</t:UID>\
+                 <t:Start>2026-07-01T15:00:00Z</t:Start><t:End>2026-07-01T15:30:00Z</t:End>\
+                 <t:Recurrence>{rec_xml}</t:Recurrence></t:CalendarItem>"
+            );
+            let parsed = parse_calendar_item(&body).unwrap();
+            let rule = crate::exchange_ews::recurrence::to_jscalendar_rule(
+                parsed.recurrence.as_ref().unwrap(),
+            )
+            .unwrap();
+            assert_eq!(rule["frequency"], freq, "for {rec_xml}");
+        }
+        let body = format!(
+            "<t:CalendarItem{NS}><t:ItemId Id=\"M\" ChangeKey=\"K\"/><t:UID>u</t:UID>\
+             <t:Start>2026-07-01T15:00:00Z</t:Start><t:End>2026-07-01T15:30:00Z</t:End>\
+             <t:Recurrence><t:RelativeMonthlyRecurrence><t:Interval>1</t:Interval>\
+             <t:DaysOfWeek>Friday</t:DaysOfWeek><t:DayOfWeekIndex>Last</t:DayOfWeekIndex></t:RelativeMonthlyRecurrence>\
+             <t:NoEndRecurrence><t:StartDate>2026-07-01Z</t:StartDate></t:NoEndRecurrence></t:Recurrence></t:CalendarItem>"
+        );
+        let parsed = parse_calendar_item(&body).unwrap();
+        let rule = crate::exchange_ews::recurrence::to_jscalendar_rule(
+            parsed.recurrence.as_ref().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(rule["byDay"][0]["day"], "fr");
+        assert_eq!(rule["byDay"][0]["nthOfPeriod"], -1);
+    }
+
+    #[test]
+    fn attendee_and_organizer_routing_type_is_parsed() {
+        let body = format!(
+            "<t:CalendarItem{NS}><t:ItemId Id=\"M\" ChangeKey=\"K\"/><t:UID>u</t:UID>\
+             <t:Organizer><t:Mailbox><t:Name>Org</t:Name>\
+               <t:EmailAddress>/o=ExLabs/cn=org</t:EmailAddress><t:RoutingType>EX</t:RoutingType></t:Mailbox></t:Organizer>\
+             <t:RequiredAttendees><t:Attendee><t:Mailbox><t:Name>Att</t:Name>\
+               <t:EmailAddress>/o=ExLabs/cn=att</t:EmailAddress><t:RoutingType>EX</t:RoutingType></t:Mailbox>\
+               <t:ResponseType>Accept</t:ResponseType></t:Attendee></t:RequiredAttendees>\
+             </t:CalendarItem>"
+        );
+        let parsed = parse_calendar_item(&body).unwrap();
+        assert_eq!(parsed.organizer_routing_type.as_deref(), Some("EX"));
+        assert_eq!(parsed.required_attendees.len(), 1);
+        assert_eq!(
+            parsed.required_attendees[0].routing_type.as_deref(),
+            Some("EX")
+        );
+        assert_eq!(
+            parsed.required_attendees[0].email.as_deref(),
+            Some("/o=ExLabs/cn=att")
+        );
     }
 
     #[test]
