@@ -93,9 +93,10 @@ fn try_sync_folder_items(
     let mut deletions: Vec<String> = Vec::new();
     let mut iters = 0;
     let mut batch = ctx.sync_batch.clamp(SYNC_BATCH_MIN, SYNC_BATCH_MAX);
+    let version = ctx.client.server_version();
     loop {
         let retries_before = ctx.client.retries_observed();
-        let body = sync_folder_items_body(folder, &sync_state, batch);
+        let body = sync_folder_items_body(folder, &sync_state, batch, version);
         let resp = match ctx.client.call(ctx.url, "SyncFolderItems", &body) {
             Ok(r) => r,
             Err(EwsError::SoapFault {

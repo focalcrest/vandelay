@@ -27,7 +27,8 @@ pub fn to_jscalendar_rule(raw: &RawRecurrence) -> Option<Value> {
             }
             let days: Vec<Value> = days_of_week
                 .iter()
-                .filter_map(|d| day_token(d).map(|t| json!({"day": t})))
+                .filter_map(|d| expand_day(d))
+                .flat_map(|slice| slice.iter().map(|t| json!({"day": t})))
                 .collect();
             if !days.is_empty() {
                 rule.insert("byDay".to_owned(), Value::Array(days));
@@ -55,23 +56,7 @@ pub fn to_jscalendar_rule(raw: &RawRecurrence) -> Option<Value> {
             if *interval > 1 {
                 rule.insert("interval".to_owned(), Value::from(*interval));
             }
-            let nth = nth_of_period(day_of_week_index);
-            let days: Vec<Value> = days_of_week
-                .iter()
-                .filter_map(|d| {
-                    day_token(d).map(|t| {
-                        let mut o = Map::new();
-                        o.insert("day".to_owned(), Value::String(t.to_owned()));
-                        if let Some(n) = nth {
-                            o.insert("nthOfPeriod".to_owned(), Value::from(n));
-                        }
-                        Value::Object(o)
-                    })
-                })
-                .collect();
-            if !days.is_empty() {
-                rule.insert("byDay".to_owned(), Value::Array(days));
-            }
+            insert_relative_by_day(&mut rule, days_of_week, day_of_week_index);
         }
         RecurrencePattern::AbsoluteYearly {
             month,
@@ -101,23 +86,7 @@ pub fn to_jscalendar_rule(raw: &RawRecurrence) -> Option<Value> {
                     Value::Array(vec![Value::String(n.to_string())]),
                 );
             }
-            let nth = nth_of_period(day_of_week_index);
-            let days: Vec<Value> = days_of_week
-                .iter()
-                .filter_map(|d| {
-                    day_token(d).map(|t| {
-                        let mut o = Map::new();
-                        o.insert("day".to_owned(), Value::String(t.to_owned()));
-                        if let Some(n) = nth {
-                            o.insert("nthOfPeriod".to_owned(), Value::from(n));
-                        }
-                        Value::Object(o)
-                    })
-                })
-                .collect();
-            if !days.is_empty() {
-                rule.insert("byDay".to_owned(), Value::Array(days));
-            }
+            insert_relative_by_day(&mut rule, days_of_week, day_of_week_index);
         }
     }
     match raw.range.as_ref() {
@@ -140,16 +109,60 @@ pub fn to_jscalendar_rule(raw: &RawRecurrence) -> Option<Value> {
     Some(Value::Object(rule))
 }
 
-fn day_token(d: &str) -> Option<&'static str> {
-    match d.to_ascii_lowercase().as_str() {
-        "monday" | "mo" => Some("mo"),
-        "tuesday" | "tu" => Some("tu"),
-        "wednesday" | "we" => Some("we"),
-        "thursday" | "th" => Some("th"),
-        "friday" | "fr" => Some("fr"),
-        "saturday" | "sa" => Some("sa"),
-        "sunday" | "su" => Some("su"),
-        _ => None,
+fn expand_day(d: &str) -> Option<&'static [&'static str]> {
+    Some(match d.to_ascii_lowercase().as_str() {
+        "monday" | "mo" => &["mo"],
+        "tuesday" | "tu" => &["tu"],
+        "wednesday" | "we" => &["we"],
+        "thursday" | "th" => &["th"],
+        "friday" | "fr" => &["fr"],
+        "saturday" | "sa" => &["sa"],
+        "sunday" | "su" => &["su"],
+        "day" => &["mo", "tu", "we", "th", "fr", "sa", "su"],
+        "weekday" => &["mo", "tu", "we", "th", "fr"],
+        "weekendday" => &["sa", "su"],
+        _ => return None,
+    })
+}
+
+fn insert_relative_by_day(rule: &mut Map<String, Value>, days_of_week: &[String], index: &str) {
+    let nth = nth_of_period(index);
+    let mut days: Vec<&'static str> = Vec::new();
+    let mut is_set = false;
+    for d in days_of_week {
+        if let Some(slice) = expand_day(d) {
+            if slice.len() > 1 {
+                is_set = true;
+            }
+            for &t in slice {
+                if !days.contains(&t) {
+                    days.push(t);
+                }
+            }
+        }
+    }
+    if days.is_empty() {
+        return;
+    }
+    if is_set {
+        let by_day: Vec<Value> = days.iter().map(|t| json!({"day": t})).collect();
+        rule.insert("byDay".to_owned(), Value::Array(by_day));
+        if let Some(n) = nth {
+            rule.insert("bySetPosition".to_owned(), json!([n]));
+        }
+    } else {
+        let by_day: Vec<Value> = days
+            .iter()
+            .map(|t| {
+                let mut o = Map::new();
+                o.insert("day".to_owned(), Value::String((*t).to_owned()));
+                if let Some(n) = nth {
+                    o.insert("nthOfPeriod".to_owned(), Value::from(n));
+                }
+                Value::Object(o)
+            })
+            .collect();
+        rule.insert("byDay".to_owned(), Value::Array(by_day));
     }
 }
 
@@ -284,6 +297,74 @@ mod tests {
         let rule = to_jscalendar_rule(&raw).unwrap();
         assert!(rule.get("until").is_none());
         assert!(rule.get("count").is_none());
+    }
+
+    #[test]
+    fn relative_monthly_first_weekday_expands_with_set_position() {
+        let raw = RawRecurrence {
+            pattern: Some(RecurrencePattern::RelativeMonthly {
+                interval: 1,
+                day_of_week_index: "First".to_owned(),
+                days_of_week: vec!["Weekday".to_owned()],
+            }),
+            range: Some(RecurrenceRange::NoEnd {
+                start_date: "2025-01-01".to_owned(),
+            }),
+        };
+        let rule = to_jscalendar_rule(&raw).unwrap();
+        let by_day = rule["byDay"].as_array().unwrap();
+        let days: Vec<&str> = by_day.iter().map(|d| d["day"].as_str().unwrap()).collect();
+        assert_eq!(days, ["mo", "tu", "we", "th", "fr"]);
+        assert!(
+            by_day.iter().all(|d| d.get("nthOfPeriod").is_none()),
+            "set-based byDay must not carry per-day nthOfPeriod"
+        );
+        assert_eq!(rule["bySetPosition"], json!([1]));
+    }
+
+    #[test]
+    fn relative_monthly_last_weekendday_uses_negative_set_position() {
+        let raw = RawRecurrence {
+            pattern: Some(RecurrencePattern::RelativeMonthly {
+                interval: 1,
+                day_of_week_index: "Last".to_owned(),
+                days_of_week: vec!["WeekendDay".to_owned()],
+            }),
+            range: Some(RecurrenceRange::NoEnd {
+                start_date: "2025-01-01".to_owned(),
+            }),
+        };
+        let rule = to_jscalendar_rule(&raw).unwrap();
+        let days: Vec<&str> = rule["byDay"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|d| d["day"].as_str().unwrap())
+            .collect();
+        assert_eq!(days, ["sa", "su"]);
+        assert_eq!(rule["bySetPosition"], json!([-1]));
+    }
+
+    #[test]
+    fn weekly_every_weekday_expands() {
+        let raw = RawRecurrence {
+            pattern: Some(RecurrencePattern::Weekly {
+                interval: 1,
+                days_of_week: vec!["Weekday".to_owned()],
+            }),
+            range: Some(RecurrenceRange::NoEnd {
+                start_date: "2025-01-06".to_owned(),
+            }),
+        };
+        let rule = to_jscalendar_rule(&raw).unwrap();
+        let days: Vec<&str> = rule["byDay"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|d| d["day"].as_str().unwrap())
+            .collect();
+        assert_eq!(days, ["mo", "tu", "we", "th", "fr"]);
+        assert!(rule.get("bySetPosition").is_none());
     }
 
     #[test]

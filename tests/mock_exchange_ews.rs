@@ -469,7 +469,7 @@ fn get_item_batches_chunk_the_id_list() {
 #[test]
 fn sync_folder_items_request_body_carries_state_and_max() {
     let folder = FolderId::new("FID", "FCK");
-    let body = sync_folder_items_body(&folder, "OPAQUE", 512);
+    let body = sync_folder_items_body(&folder, "OPAQUE", 512, ServerVersion::Exchange2013Sp1);
     assert!(body.contains("<m:SyncState>OPAQUE</m:SyncState>"));
     assert!(body.contains("<m:MaxChangesReturned>512</m:MaxChangesReturned>"));
     assert!(body.contains("<m:SyncScope>NormalItems</m:SyncScope>"));

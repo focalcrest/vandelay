@@ -99,7 +99,12 @@ pub fn find_item_body(
     out
 }
 
-pub fn sync_folder_items_body(folder: &FolderId, sync_state: &str, max_changes: u32) -> String {
+pub fn sync_folder_items_body(
+    folder: &FolderId,
+    sync_state: &str,
+    max_changes: u32,
+    version: ServerVersion,
+) -> String {
     let mut out = String::with_capacity(512);
     out.push_str("<m:SyncFolderItems><m:ItemShape>");
     out.push_str("<t:BaseShape>IdOnly</t:BaseShape>");
@@ -112,7 +117,9 @@ pub fn sync_folder_items_body(folder: &FolderId, sync_state: &str, max_changes: 
     out.push_str("<m:MaxChangesReturned>");
     out.push_str(&max_changes.to_string());
     out.push_str("</m:MaxChangesReturned>");
-    out.push_str("<m:SyncScope>NormalItems</m:SyncScope>");
+    if version >= ServerVersion::Exchange2010 {
+        out.push_str("<m:SyncScope>NormalItems</m:SyncScope>");
+    }
     out.push_str("</m:SyncFolderItems>");
     out
 }
@@ -153,6 +160,10 @@ pub fn get_item_body(shape: ItemShape, ids: &[ItemId], version: ServerVersion) -
                 out.push_str(f);
                 out.push_str("\"/>");
             }
+            if version >= ServerVersion::Exchange2010 {
+                out.push_str("<t:FieldURI FieldURI=\"calendar:StartTimeZone\"/>");
+                out.push_str("<t:FieldURI FieldURI=\"calendar:EndTimeZone\"/>");
+            }
             out.push_str("</t:AdditionalProperties>");
         }
         ItemShape::Contact => {
@@ -190,8 +201,6 @@ const CALENDAR_FIELDS: &[&str] = &[
     "calendar:Recurrence",
     "calendar:ModifiedOccurrences",
     "calendar:DeletedOccurrences",
-    "calendar:StartTimeZone",
-    "calendar:EndTimeZone",
     "calendar:Duration",
     "item:Subject",
     "item:Body",
@@ -349,7 +358,7 @@ mod tests {
     #[test]
     fn sync_folder_items_body_carries_state_and_max() {
         let folder = FolderId::new("FID", "FCK");
-        let body = sync_folder_items_body(&folder, "STATE", 512);
+        let body = sync_folder_items_body(&folder, "STATE", 512, ServerVersion::Exchange2013Sp1);
         assert!(body.contains("<m:SyncFolderId><t:FolderId Id=\"FID\" ChangeKey=\"FCK\"/>"));
         assert!(body.contains("<m:SyncState>STATE</m:SyncState>"));
         assert!(body.contains("<m:MaxChangesReturned>512</m:MaxChangesReturned>"));
@@ -357,9 +366,35 @@ mod tests {
     }
 
     #[test]
+    fn sync_scope_omitted_below_exchange_2010() {
+        let folder = FolderId::new("FID", "");
+        let modern = sync_folder_items_body(&folder, "", 100, ServerVersion::Exchange2010);
+        assert!(modern.contains("<m:SyncScope>NormalItems</m:SyncScope>"));
+        let legacy = sync_folder_items_body(&folder, "", 100, ServerVersion::Exchange2007);
+        assert!(
+            !legacy.contains("SyncScope"),
+            "SyncScope is an Exchange 2010 addition"
+        );
+    }
+
+    #[test]
+    fn calendar_timezone_fields_gated_on_exchange_2010() {
+        let modern =
+            get_item_body(ItemShape::CalendarItem, &[ItemId::new("X", "")], ServerVersion::Exchange2010);
+        assert!(modern.contains("calendar:StartTimeZone"));
+        assert!(modern.contains("calendar:EndTimeZone"));
+        let legacy =
+            get_item_body(ItemShape::CalendarItem, &[ItemId::new("X", "")], ServerVersion::Exchange2007);
+        assert!(
+            !legacy.contains("TimeZone"),
+            "StartTimeZone/EndTimeZone are Exchange 2010 additions"
+        );
+    }
+
+    #[test]
     fn sync_folder_items_empty_state_round_trips() {
         let folder = FolderId::new("FID", "");
-        let body = sync_folder_items_body(&folder, "", 100);
+        let body = sync_folder_items_body(&folder, "", 100, ServerVersion::Exchange2013Sp1);
         assert!(body.contains("<m:SyncState></m:SyncState>"));
     }
 
