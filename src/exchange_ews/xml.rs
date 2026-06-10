@@ -5,7 +5,7 @@
  */
 
 use crate::exchange_ews::soap::write_escaped;
-use crate::exchange_ews::types::{DistinguishedFolderId, FolderId, ItemId};
+use crate::exchange_ews::types::{DistinguishedFolderId, FolderId, ItemId, ServerVersion};
 
 #[derive(Debug, Clone, Copy)]
 pub enum FolderRef<'a> {
@@ -124,7 +124,7 @@ pub enum ItemShape {
     Contact,
 }
 
-pub fn get_item_body(shape: ItemShape, ids: &[ItemId]) -> String {
+pub fn get_item_body(shape: ItemShape, ids: &[ItemId], version: ServerVersion) -> String {
     let mut out = String::with_capacity(256 + ids.len() * 128);
     out.push_str("<m:GetItem><m:ItemShape>");
     match shape {
@@ -134,11 +134,13 @@ pub fn get_item_body(shape: ItemShape, ids: &[ItemId]) -> String {
             out.push_str("<t:BodyType>Best</t:BodyType>");
             out.push_str("<t:AdditionalProperties>");
             out.push_str("<t:FieldURI FieldURI=\"item:DateTimeReceived\"/>");
-            out.push_str("<t:FieldURI FieldURI=\"item:IsRead\"/>");
+            out.push_str("<t:FieldURI FieldURI=\"message:IsRead\"/>");
             out.push_str("<t:FieldURI FieldURI=\"item:IsDraft\"/>");
             out.push_str("<t:FieldURI FieldURI=\"item:Categories\"/>");
             out.push_str("<t:FieldURI FieldURI=\"item:ParentFolderId\"/>");
-            out.push_str("<t:FieldURI FieldURI=\"item:Flag\"/>");
+            if version >= ServerVersion::Exchange2013 {
+                out.push_str("<t:FieldURI FieldURI=\"item:Flag\"/>");
+            }
             out.push_str("<t:FieldURI FieldURI=\"message:IsReadReceiptRequested\"/>");
             out.push_str("</t:AdditionalProperties>");
         }
@@ -302,15 +304,34 @@ mod tests {
     #[test]
     fn get_item_message_shape_requests_mime() {
         let ids = vec![ItemId::new("I1", "CK1"), ItemId::new("I2", "")];
-        let body = get_item_body(ItemShape::Message, &ids);
+        let body = get_item_body(ItemShape::Message, &ids, ServerVersion::Exchange2013Sp1);
         assert!(body.contains("<t:IncludeMimeContent>true</t:IncludeMimeContent>"));
         assert!(body.contains("<t:ItemId Id=\"I1\" ChangeKey=\"CK1\"/>"));
         assert!(body.contains("<t:ItemId Id=\"I2\"/>"));
     }
 
     #[test]
+    fn item_flag_requested_only_on_exchange_2013_and_later() {
+        let ids = [ItemId::new("I1", "")];
+        let modern = get_item_body(ItemShape::Message, &ids, ServerVersion::Exchange2013Sp1);
+        assert!(modern.contains("item:Flag"));
+        let legacy = get_item_body(ItemShape::Message, &ids, ServerVersion::Exchange2010Sp2);
+        assert!(
+            !legacy.contains("item:Flag"),
+            "item:Flag is an Exchange 2013 schema addition; must be omitted on 2010"
+        );
+        assert!(legacy.contains("item:DateTimeReceived"));
+        assert!(legacy.contains("message:IsReadReceiptRequested"));
+        assert!(
+            modern.contains("\"message:IsRead\"") && !modern.contains("\"item:IsRead\""),
+            "IsRead is a MessageType property; its FieldURI is message:IsRead"
+        );
+    }
+
+    #[test]
     fn get_item_calendar_shape_lists_calendar_fields() {
-        let body = get_item_body(ItemShape::CalendarItem, &[ItemId::new("X", "")]);
+        let body =
+            get_item_body(ItemShape::CalendarItem, &[ItemId::new("X", "")], ServerVersion::Exchange2010Sp2);
         assert!(body.contains("calendar:Recurrence"));
         assert!(body.contains("calendar:ModifiedOccurrences"));
         assert!(body.contains("calendar:DeletedOccurrences"));
@@ -320,7 +341,8 @@ mod tests {
 
     #[test]
     fn get_item_contact_shape_requests_all_properties() {
-        let body = get_item_body(ItemShape::Contact, &[ItemId::new("X", "")]);
+        let body =
+            get_item_body(ItemShape::Contact, &[ItemId::new("X", "")], ServerVersion::Exchange2013Sp1);
         assert!(body.contains("<t:BaseShape>AllProperties</t:BaseShape>"));
     }
 

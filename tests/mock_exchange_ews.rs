@@ -458,7 +458,7 @@ fn get_item_batches_chunk_the_id_list() {
     let chunks: Vec<&[ItemId]> = ids.chunks(3).collect();
     assert_eq!(chunks.len(), 3);
     for chunk in &chunks {
-        let body = get_item_body(ItemShape::Message, chunk);
+        let body = get_item_body(ItemShape::Message, chunk, ServerVersion::Exchange2013Sp1);
         assert!(body.contains("<m:GetItem>"));
         for id in *chunk {
             assert!(body.contains(&format!("Id=\"{}\"", id.id)));

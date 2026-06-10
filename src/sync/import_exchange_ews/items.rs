@@ -286,11 +286,12 @@ pub fn get_items(
 ) -> Result<GetItemBatchOutcome, EwsError> {
     let batch = ctx.batch_size.max(1);
     let workers = ctx.connections.clamp(1, 8);
+    let version = ctx.client.server_version();
     let mut failed_items: u64 = 0;
     if workers <= 1 || ids.len() <= batch {
         let mut all = Vec::new();
         for chunk in ids.chunks(batch) {
-            let body = get_item_body(shape, chunk);
+            let body = get_item_body(shape, chunk, version);
             match ctx.client.call(ctx.url, "GetItem", &body) {
                 Ok(resp) => match parse_response_messages(&resp.body, b"GetItemResponseMessage") {
                     Ok(mut msgs) => all.append(&mut msgs),
@@ -326,7 +327,7 @@ pub fn get_items(
     );
     let pool: crate::sync::import_jmap::pool::Pool<Vec<ItemId>, BatchResult> =
         crate::sync::import_jmap::pool::Pool::new(workers, move |chunk: Vec<ItemId>| {
-            let body = get_item_body(shape, &chunk);
+            let body = get_item_body(shape, &chunk, version);
             let n = chunk.len();
             let result = match client.call(&url, "GetItem", &body) {
                 Ok(resp) => parse_response_messages(&resp.body, b"GetItemResponseMessage"),
