@@ -2,7 +2,7 @@
 
 All notable changes to this project will be documented in this file. This project adheres to [Semantic Versioning](http://semver.org/).
 
-## [1.0.2] - 2026-06-XX
+## [1.0.2] - 2026-06-11
 
 ### Added
 
@@ -10,7 +10,7 @@ All notable changes to this project will be documented in this file. This projec
 
 ### Fixed
 - IMAP: Import fails with `BAD` on servers that advertise `LIST-EXTENDED` without `SPECIAL-USE`.
-- MS Exchange EWS: add support for version negotiation and other enhancements (#6).
+- MS Exchange EWS: add support for version negotiation and other fixes (#6).
 
 ## [1.0.1] - 2026-06-04
 
