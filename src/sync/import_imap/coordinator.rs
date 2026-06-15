@@ -564,26 +564,28 @@ fn upsert_mailboxes(
         };
         let existing = db::imap_ids::local_for_mailbox(&tx, source_id, &folder.name)?;
         let id = if let Some(id) = existing {
+            let role = db::roles::unique_role(&tx, folder.role, Some(id))?;
             tx.execute(
                 "UPDATE mailboxes SET name = ?1, parent_id = ?2, role = ?3,
                  is_subscribed = ?4 WHERE id = ?5",
                 params![
                     folder.leaf,
                     parent_local,
-                    folder.role,
+                    role,
                     folder.subscribed as i64,
                     id
                 ],
             )?;
             id
         } else {
+            let role = db::roles::unique_role(&tx, folder.role, None)?;
             tx.execute(
                 "INSERT INTO mailboxes (name, parent_id, role, sort_order, is_subscribed)
                  VALUES (?1, ?2, ?3, 0, ?4)",
                 params![
                     folder.leaf,
                     parent_local,
-                    folder.role,
+                    role,
                     folder.subscribed as i64
                 ],
             )?;

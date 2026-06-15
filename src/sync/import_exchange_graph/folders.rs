@@ -91,6 +91,7 @@ pub fn reconcile_mail(
             server_ids.push(graph_id.to_owned());
 
             let local_id = if let Some(id) = existing {
+                let role = crate::db::roles::unique_role(&tx, role, Some(id))?;
                 tx.execute(
                     "UPDATE mailboxes SET name = ?1, parent_id = ?2, role = ?3, is_subscribed = ?4
                      WHERE id = ?5",
@@ -99,6 +100,7 @@ pub fn reconcile_mail(
                 counts.fetched += 1;
                 id
             } else {
+                let role = crate::db::roles::unique_role(&tx, role, None)?;
                 tx.execute(
                     "INSERT INTO mailboxes (name, parent_id, role, sort_order, is_subscribed)
                      VALUES (?1, ?2, ?3, 0, ?4)",

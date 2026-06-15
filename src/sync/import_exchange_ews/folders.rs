@@ -380,6 +380,8 @@ fn upsert_mailbox(
         .map_err(|e| Error::Partial(e.to_string()))?;
     let existing = ctx.local.get(&folder.folder.folder_id.id);
     let local_id = if let Some(row) = existing {
+        let role = crate::db::roles::unique_role(&tx, role, Some(row.local_id))
+            .map_err(|e| Error::Partial(e.to_string()))?;
         tx.execute(
             "UPDATE mailboxes SET name = ?1, parent_id = ?2, role = ?3 WHERE id = ?4",
             params![folder.folder.display_name, parent_local, role, row.local_id],
@@ -396,6 +398,8 @@ fn upsert_mailbox(
         ctx.counts.fetched += 1;
         row.local_id
     } else {
+        let role = crate::db::roles::unique_role(&tx, role, None)
+            .map_err(|e| Error::Partial(e.to_string()))?;
         tx.execute(
             "INSERT INTO mailboxes (name, parent_id, role, sort_order, is_subscribed) \
              VALUES (?1, ?2, ?3, 0, 1)",

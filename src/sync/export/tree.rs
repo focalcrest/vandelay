@@ -160,6 +160,8 @@ pub fn reconcile(
         .unwrap_or(0);
 
     let mut uploader = Uploader::new(net, &ctx.conn);
+    let mut taken_roles: HashSet<String> =
+        targets.iter().filter_map(|t| t.role.clone()).collect();
     let interleave = ty == ObjectType::FileNode;
     for d in 0..=max_depth {
         let level: Vec<&LocalNode> = to_create
@@ -225,7 +227,22 @@ pub fn reconcile(
                 continue;
             }
             match build_create(ctx, ty, n.local, maps, &mut uploader) {
-                Ok(obj) => {
+                Ok(mut obj) => {
+                    if ty == ObjectType::Mailbox
+                        && let Some(r) = n.role.as_deref()
+                    {
+                        if taken_roles.contains(r) {
+                            if let Value::Object(m) = &mut obj {
+                                m.remove("role");
+                            }
+                            logger.warn(&format!(
+                                "Mailbox local {}: role '{r}' already present on target, creating as a plain folder",
+                                n.local
+                            ));
+                        } else {
+                            taken_roles.insert(r.to_owned());
+                        }
+                    }
                     batch.push((format!("c{}", n.local), obj));
                 }
                 Err(e) => {

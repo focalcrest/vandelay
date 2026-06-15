@@ -2347,3 +2347,201 @@ fn first_run_cursor_is_captured_up_front_not_from_the_fetch() {
     );
     let _ = std::fs::remove_file(&archive);
 }
+
+#[test]
+fn export_duplicate_role_mailbox_created_as_plain_folder_keeping_subtree() {
+    let mut server = mockito::Server::new();
+    let base = server.url();
+    let api = "/jmap/api";
+    let archive = tmp();
+    {
+        let conn = db::init::open(&archive).unwrap();
+        conn.execute(
+            "INSERT INTO mailboxes (id,name,parent_id,role) VALUES (1,'Inbox',NULL,'inbox')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO mailboxes (id,name,parent_id,role) VALUES (2,'Sent',NULL,'sent')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO mailboxes (id,name,parent_id,role) VALUES (3,'Éléments envoyés',NULL,'sent')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO mailboxes (id,name,parent_id,role) VALUES (4,'Brouillons locaux',3,NULL)",
+            [],
+        )
+        .unwrap();
+    }
+
+    let _root = server.mock("GET", "/").with_status(404).create();
+    let _wk = server
+        .mock("GET", "/.well-known/jmap")
+        .with_body(session_body_full(&base))
+        .expect_at_least(1)
+        .create();
+    let _mbterm = anchor_terminator(&mut server, api, "Mailbox");
+
+    let _mq = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("Mailbox/query".into()))
+        .with_body(
+            json!({"methodResponses":[["Mailbox/query",
+                {"accountId":"w","ids":["TI","TS"]},"q"]]})
+            .to_string(),
+        )
+        .expect_at_least(1)
+        .create();
+    let _mg = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("Mailbox/get".into()))
+        .with_body(
+            json!({"methodResponses":[["Mailbox/get",{"accountId":"w","list":[
+                {"id":"TI","name":"Inbox","role":"inbox","parentId":null,"myRights":{"mayDelete":true}},
+                {"id":"TS","name":"Sent","role":"sent","parentId":null,"myRights":{"mayDelete":true}}
+            ],"notFound":[]},"g"]]})
+            .to_string(),
+        )
+        .expect_at_least(1)
+        .create();
+
+    let role_create = server
+        .mock("POST", api)
+        .match_body(Matcher::AllOf(vec![
+            Matcher::Regex("Mailbox/set".into()),
+            Matcher::Regex("envoy".into()),
+            Matcher::Regex("\"role\"".into()),
+        ]))
+        .with_body(
+            json!({"methodResponses":[["Mailbox/set",{"accountId":"w",
+                "notCreated":{"c3":{"type":"invalidProperties","properties":["role"],
+                "description":"A mailbox with role 'sent' already exists."}}},"s"]]})
+            .to_string(),
+        )
+        .expect_at_most(1)
+        .create();
+    let folder_create = server
+        .mock("POST", api)
+        .match_body(Matcher::AllOf(vec![
+            Matcher::Regex("Mailbox/set".into()),
+            Matcher::Regex("envoy".into()),
+        ]))
+        .with_body(
+            json!({"methodResponses":[["Mailbox/set",{"accountId":"w",
+                "created":{"c3":{"id":"M3"}}},"s"]]})
+            .to_string(),
+        )
+        .expect(1)
+        .create();
+    let child_create = server
+        .mock("POST", api)
+        .match_body(Matcher::AllOf(vec![
+            Matcher::Regex("Mailbox/set".into()),
+            Matcher::Regex("Brouillons".into()),
+        ]))
+        .with_body(
+            json!({"methodResponses":[["Mailbox/set",{"accountId":"w",
+                "created":{"c4":{"id":"M4"}}},"s"]]})
+            .to_string(),
+        )
+        .expect(1)
+        .create();
+
+    let summary = sync::export::run(
+        common(&archive),
+        export_cfg_objects(&base, vec![ObjectType::Mailbox]),
+    )
+    .expect("export");
+
+    role_create.assert();
+    folder_create.assert();
+    child_create.assert();
+
+    let counts = summary
+        .per_type
+        .iter()
+        .find(|(t, _)| *t == "Mailbox")
+        .map(|(_, c)| c.clone())
+        .expect("mailbox counts");
+    assert_eq!(counts.skipped, 2, "Inbox and Sent match existing role mailboxes");
+    assert_eq!(
+        counts.created, 2,
+        "duplicate-role folder and its child are both created"
+    );
+    assert_eq!(counts.failed, 0, "no cascade skip of the subtree");
+    let _ = std::fs::remove_file(&archive);
+}
+
+#[test]
+fn import_jmap_duplicate_role_is_deduplicated_to_single_mailbox() {
+    let mut server = mockito::Server::new();
+    let base = server.url();
+    let api = "/jmap/api";
+    let archive = tmp();
+
+    let _root = server.mock("GET", "/").with_status(404).create();
+    let _wk = server
+        .mock("GET", "/.well-known/jmap")
+        .with_body(session_body_full(&base))
+        .expect_at_least(1)
+        .create();
+    let _term = anchor_terminator(&mut server, api, "Mailbox");
+
+    let _q = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("Mailbox/query".into()))
+        .with_body(
+            json!({"methodResponses":[["Mailbox/query",
+                {"accountId":"w","ids":["A","B","C"]},"q"]]})
+            .to_string(),
+        )
+        .expect(1)
+        .create();
+    let _g = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("Mailbox/get".into()))
+        .with_body(
+            json!({"methodResponses":[["Mailbox/get",{"accountId":"w","state":"s1","list":[
+                {"id":"A","name":"Sent","parentId":null,"role":"sent","sortOrder":0,"isSubscribed":true},
+                {"id":"B","name":"Éléments envoyés","parentId":null,"role":"sent","sortOrder":0,"isSubscribed":true},
+                {"id":"C","name":"Sent Items","parentId":null,"role":"sent","sortOrder":0,"isSubscribed":true}
+            ],"notFound":[]},"g"]]})
+            .to_string(),
+        )
+        .expect(1)
+        .create();
+
+    sync::import_jmap::run(
+        common(&archive),
+        import_cfg_objects(&base, vec![ObjectType::Mailbox]),
+    )
+    .expect("import");
+
+    let conn = rusqlite::Connection::open(&archive).unwrap();
+    let total: i64 = conn
+        .query_row("SELECT count(*) FROM mailboxes", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(total, 3, "all three folders are imported");
+    let with_role: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM mailboxes WHERE role = 'sent'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(with_role, 1, "exactly one mailbox keeps the sent role");
+    let null_roles: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM mailboxes WHERE role IS NULL",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(null_roles, 2, "the surplus duplicates become plain folders");
+    drop(conn);
+    let _ = std::fs::remove_file(&archive);
+}

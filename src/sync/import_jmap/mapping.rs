@@ -113,13 +113,14 @@ pub fn insert_mailbox(
     resolver: &impl LocalResolver,
 ) -> Result<i64, JmapError> {
     let parent = opt_parent(resolver, ObjectType::Mailbox, &wire.parent_id);
+    let role = crate::db::roles::unique_role(conn, wire.role.as_deref(), None)?;
     conn.execute(
         "INSERT INTO mailboxes (name, parent_id, role, sort_order, is_subscribed)
          VALUES (?1, ?2, ?3, ?4, ?5)",
         params![
             wire.name,
             parent,
-            wire.role,
+            role,
             wire.sort_order,
             wire.is_subscribed as i64
         ],
@@ -401,6 +402,7 @@ pub fn update_mailbox(
     resolver: &impl LocalResolver,
 ) -> Result<bool, JmapError> {
     let parent = opt_parent(resolver, ObjectType::Mailbox, &wire.parent_id);
+    let role = crate::db::roles::unique_role(conn, wire.role.as_deref(), Some(local_id))?;
     let n = conn.execute(
         "UPDATE mailboxes SET name = ?1, parent_id = ?2, role = ?3, sort_order = ?4,
             is_subscribed = ?5
@@ -409,7 +411,7 @@ pub fn update_mailbox(
         params![
             wire.name,
             parent,
-            wire.role,
+            role,
             wire.sort_order,
             wire.is_subscribed as i64,
             local_id
