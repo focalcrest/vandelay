@@ -4,7 +4,11 @@
  * SPDX-License-Identifier: Apache-2.0 OR MIT
  */
 
+use std::borrow::Cow;
 use std::collections::BTreeSet;
+
+use mail_parser::HeaderValue;
+use mail_parser::parsers::MessageStream;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LabelClassification {
@@ -43,12 +47,26 @@ pub struct MailboxAssignment {
 }
 
 pub fn parse_header(value: &str) -> Vec<String> {
-    value
+    let decoded = decode_encoded_words(value);
+    decoded
         .split(',')
         .map(str::trim)
         .filter(|t| !t.is_empty())
         .map(str::to_owned)
         .collect()
+}
+
+fn decode_encoded_words(value: &str) -> Cow<'_, str> {
+    if !value.contains("=?") {
+        return Cow::Borrowed(value);
+    }
+    let mut buf = Vec::with_capacity(value.len() + 1);
+    buf.extend_from_slice(value.as_bytes());
+    buf.push(b'\n');
+    match MessageStream::new(&buf).parse_unstructured() {
+        HeaderValue::Text(text) => Cow::Owned(text.into_owned()),
+        _ => Cow::Borrowed(value),
+    }
 }
 
 pub fn classify(tokens: &[String]) -> LabelClassification {
@@ -156,6 +174,24 @@ mod tests {
     fn parse_header_splits_on_comma_and_trims() {
         let v = parse_header("Inbox, Opened ,Starred,,Important");
         assert_eq!(v, vec!["Inbox", "Opened", "Starred", "Important"]);
+    }
+
+    #[test]
+    fn parse_header_decodes_rfc2047_encoded_words() {
+        let v = parse_header("=?UTF-8?Q?=C3=85pnet,Kategori:_Reklame?=");
+        assert_eq!(v, vec!["Åpnet", "Kategori: Reklame"]);
+    }
+
+    #[test]
+    fn parse_header_decodes_mixed_plain_and_encoded_tokens() {
+        let v = parse_header("Inbox,=?UTF-8?Q?=C3=85pnet?=,Github");
+        assert_eq!(v, vec!["Inbox", "Åpnet", "Github"]);
+    }
+
+    #[test]
+    fn parse_header_leaves_plain_ascii_untouched() {
+        let v = parse_header("Inbox,Opened,Label_001/Label_002");
+        assert_eq!(v, vec!["Inbox", "Opened", "Label_001/Label_002"]);
     }
 
     #[test]

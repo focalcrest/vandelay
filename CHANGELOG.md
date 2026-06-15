@@ -10,6 +10,7 @@ All notable changes to this project will be documented in this file. This projec
 
 ### Fixed
 - Mailbox roles must be unique per archive (#8).
+- Google takeout: Decode MIME-encoded values in `X-Gmail-Labels`.
 
 # Change Log
 
