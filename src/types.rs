@@ -66,9 +66,8 @@ impl ObjectType {
 
     pub fn capability_urn(self) -> &'static str {
         match self {
-            ObjectType::Mailbox | ObjectType::Email | ObjectType::Identity => {
-                "urn:ietf:params:jmap:mail"
-            }
+            ObjectType::Mailbox | ObjectType::Email => "urn:ietf:params:jmap:mail",
+            ObjectType::Identity => "urn:ietf:params:jmap:submission",
             ObjectType::SieveScript => "urn:ietf:params:jmap:sieve",
             ObjectType::AddressBook | ObjectType::ContactCard => "urn:ietf:params:jmap:contacts",
             ObjectType::Calendar | ObjectType::CalendarEvent | ObjectType::ParticipantIdentity => {

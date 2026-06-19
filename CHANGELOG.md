@@ -2,6 +2,15 @@
 
 All notable changes to this project will be documented in this file. This project adheres to [Semantic Versioning](http://semver.org/).
 
+## [1.0.4] - 2026-06-XX
+
+### Added
+
+### Changed
+
+### Fixed
+- Include correct JMAP capabilities in `using`.
+
 ## [1.0.3] - 2026-06-15
 
 ### Added
@@ -11,10 +20,6 @@ All notable changes to this project will be documented in this file. This projec
 ### Fixed
 - Mailbox roles must be unique per archive (#8).
 - Google takeout: Decode MIME-encoded values in `X-Gmail-Labels` (#7).
-
-# Change Log
-
-All notable changes to this project will be documented in this file. This project adheres to [Semantic Versioning](http://semver.org/).
 
 ## [1.0.2] - 2026-06-11
 

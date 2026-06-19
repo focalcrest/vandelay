@@ -18,7 +18,8 @@ pub const URN_CORE: &str = "urn:ietf:params:jmap:core";
 pub fn using_urn(method: &str) -> &'static str {
     let prefix = method.split('/').next().unwrap_or(method);
     match prefix {
-        "Mailbox" | "Email" | "Identity" => "urn:ietf:params:jmap:mail",
+        "Mailbox" | "Email" => "urn:ietf:params:jmap:mail",
+        "Identity" => "urn:ietf:params:jmap:submission",
         "SieveScript" => "urn:ietf:params:jmap:sieve",
         "AddressBook" | "ContactCard" => "urn:ietf:params:jmap:contacts",
         "Calendar" | "CalendarEvent" | "ParticipantIdentity" => "urn:ietf:params:jmap:calendars",
@@ -743,6 +744,7 @@ mod tests {
             using_urn("CalendarEvent/set"),
             "urn:ietf:params:jmap:calendars"
         );
+        assert_eq!(using_urn("Identity/get"), "urn:ietf:params:jmap:submission");
     }
 
     #[test]

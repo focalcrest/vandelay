@@ -16,6 +16,7 @@ use super::jmap::Jmap;
 
 const CORE: &str = "urn:ietf:params:jmap:core";
 const MAIL: &str = "urn:ietf:params:jmap:mail";
+const SUBMISSION: &str = "urn:ietf:params:jmap:submission";
 const SIEVE: &str = "urn:ietf:params:jmap:sieve";
 const CONTACTS: &str = "urn:ietf:params:jmap:contacts";
 const CALENDARS: &str = "urn:ietf:params:jmap:calendars";
@@ -239,7 +240,7 @@ fn seed_sieve(jmap: &Jmap, account_id: &str, active: bool) -> SeedResult<()> {
 
 fn seed_identity(jmap: &Jmap, account_id: &str, account_email: &str) -> SeedResult<()> {
     jmap.set_create(
-        &[CORE, MAIL],
+        &[CORE, SUBMISSION],
         "Identity/set",
         account_id,
         json!({
