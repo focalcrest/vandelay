@@ -14,6 +14,7 @@ use serde_json::{Value, json};
 
 const CORE: &str = "urn:ietf:params:jmap:core";
 const MAIL: &str = "urn:ietf:params:jmap:mail";
+const SUBMISSION: &str = "urn:ietf:params:jmap:submission";
 const SIEVE: &str = "urn:ietf:params:jmap:sieve";
 const CONTACTS: &str = "urn:ietf:params:jmap:contacts";
 const CALENDARS: &str = "urn:ietf:params:jmap:calendars";
@@ -110,7 +111,7 @@ fn verify_account(label: &str, user: &Jmap, account_id: &str, s: &SeedStats) {
 
     let identities = user
         .call(
-            &[CORE, MAIL],
+            &[CORE, SUBMISSION],
             "Identity/get",
             account_id,
             json!({ "properties": ["id", "name"] }),

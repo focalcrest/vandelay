@@ -35,10 +35,11 @@ pub fn load_mbox(limit: usize) -> SeedResult<Vec<MboxMessage>> {
     for item in MessageIterator::new(reader) {
         let message = item.map_err(|e| SeedError::Resource(format!("mbox parse: {e}")))?;
         let received_at = message.internal_date() as i64;
-        out.push(MboxMessage {
-            raw: message.unwrap_contents(),
-            received_at,
-        });
+        let raw = message.unwrap_contents();
+        if !starts_with_header(&raw) {
+            continue;
+        }
+        out.push(MboxMessage { raw, received_at });
         if out.len() >= limit {
             break;
         }
@@ -47,6 +48,27 @@ pub fn load_mbox(limit: usize) -> SeedResult<Vec<MboxMessage>> {
         return Err(SeedError::Resource("mbox yielded no messages".to_owned()));
     }
     Ok(out)
+}
+
+fn starts_with_header(raw: &[u8]) -> bool {
+    let mut rest = raw;
+    if rest.starts_with(b"From ") {
+        match rest.iter().position(|b| *b == b'\n') {
+            Some(nl) => rest = &rest[nl + 1..],
+            None => return false,
+        }
+    }
+    let line_end = rest.iter().position(|b| *b == b'\n').unwrap_or(rest.len());
+    let line = &rest[..line_end];
+    let Some(colon) = line.iter().position(|b| *b == b':') else {
+        return false;
+    };
+    if colon == 0 {
+        return false;
+    }
+    line[..colon]
+        .iter()
+        .all(|b| b.is_ascii_graphic() && *b != b':')
 }
 
 fn read_dir_sorted(sub: &str, ext: &str) -> SeedResult<Vec<PathBuf>> {

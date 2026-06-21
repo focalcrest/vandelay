@@ -131,6 +131,10 @@ fn try_treat_url_as_home_or_collection(
         {
             return Ok(None);
         }
+        Err(DiscoveryError::Transport(JmapError::Malformed(_)))
+        | Err(DiscoveryError::Transport(JmapError::RetriesExhausted(_))) => {
+            return Ok(None);
+        }
         Err(e) => return Err(e),
     };
     if collections.is_empty() {
@@ -158,7 +162,7 @@ fn resolve_principal_url(
         Err(JmapError::HttpStatus { status, .. }) if (400..600).contains(&status) => {
             return Ok(None);
         }
-        Err(JmapError::RetriesExhausted(_)) => return Ok(None),
+        Err(JmapError::RetriesExhausted(_)) | Err(JmapError::Malformed(_)) => return Ok(None),
         Err(e) => return Err(DiscoveryError::Transport(e)),
     };
     let final_url = ms.final_url.clone();
@@ -186,7 +190,7 @@ fn try_via_principal(
         Err(JmapError::HttpStatus { status, .. }) if (400..600).contains(&status) => {
             return Ok(None);
         }
-        Err(JmapError::RetriesExhausted(_)) => return Ok(None),
+        Err(JmapError::RetriesExhausted(_)) | Err(JmapError::Malformed(_)) => return Ok(None),
         Err(e) => return Err(DiscoveryError::Transport(e)),
     };
     let first_final_url = first_ms.final_url.clone();
@@ -217,7 +221,9 @@ fn try_via_principal(
                 Err(JmapError::HttpStatus { status, .. }) if (400..600).contains(&status) => {
                     return Ok(None);
                 }
-                Err(JmapError::RetriesExhausted(_)) => return Ok(None),
+                Err(JmapError::RetriesExhausted(_)) | Err(JmapError::Malformed(_)) => {
+                    return Ok(None)
+                }
                 Err(e) => return Err(DiscoveryError::Transport(e)),
             };
         let principal_after_redirect = home_ms.final_url.clone();
