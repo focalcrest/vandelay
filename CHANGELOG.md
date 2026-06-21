@@ -10,6 +10,7 @@ All notable changes to this project will be documented in this file. This projec
 
 ### Fixed
 - Include correct JMAP capabilities in `using`.
+- Failures are double-counted.
 
 ## [1.0.3] - 2026-06-15
 

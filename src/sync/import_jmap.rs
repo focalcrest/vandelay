@@ -448,7 +448,7 @@ fn insert_objects(
         let blobs = if blob_refs.is_empty() {
             HashMap::new()
         } else {
-            download_blobs(net, blob_refs, threads, logger, counts)
+            download_blobs(net, blob_refs, threads, logger)
         };
         let tx = ctx
             .conn
@@ -550,7 +550,6 @@ fn download_blobs(
     refs: Vec<BlobRef>,
     threads: usize,
     logger: &Logger,
-    counts: &mut TypeCounts,
 ) -> HashMap<String, Vec<u8>> {
     let workers = effective_workers(threads, &net.limits, true);
     let net_arc = Arc::new(net.clone());
@@ -580,7 +579,6 @@ fn download_blobs(
             }
             Err(e) => {
                 logger.warn(&format!("blob {blob_id} download failed: {e}"));
-                counts.failed += 1;
             }
         }
     }
@@ -849,7 +847,7 @@ fn update_objects(
         let blobs = if blob_refs.is_empty() {
             HashMap::new()
         } else {
-            download_blobs(net, blob_refs, threads, logger, counts)
+            download_blobs(net, blob_refs, threads, logger)
         };
         let tx = ctx
             .conn

@@ -787,6 +787,110 @@ fn import_removes_vanished_email_and_drops_cross_ref() {
 }
 
 #[test]
+fn import_missing_email_blob_is_skipped_and_counted_once() {
+    let mut server = mockito::Server::new();
+    let base = server.url();
+    let api = "/jmap/api";
+    let archive = tmp();
+
+    let _root = server.mock("GET", "/").with_status(404).create();
+    let _wk = server
+        .mock("GET", "/.well-known/jmap")
+        .with_body(session_body_full(&base))
+        .expect_at_least(1)
+        .create();
+    let _mbterm = anchor_terminator(&mut server, api, "Mailbox");
+    let _emterm = anchor_terminator(&mut server, api, "Email");
+
+    let _mbq = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("Mailbox/query".into()))
+        .with_body(
+            json!({"methodResponses":[["Mailbox/query",
+                {"accountId":"w","ids":["MX"]},"q"]]})
+            .to_string(),
+        )
+        .create();
+    let _mbg = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("Mailbox/get".into()))
+        .with_body(
+            json!({"methodResponses":[["Mailbox/get",{"accountId":"w","state":"sm1","list":[
+                {"id":"MX","name":"Inbox","parentId":null,"role":"inbox","sortOrder":0,"isSubscribed":true}
+            ],"notFound":[]},"g"]]})
+            .to_string(),
+        )
+        .create();
+    let _eq = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("Email/query".into()))
+        .with_body(
+            json!({"methodResponses":[["Email/query",
+                {"accountId":"w","ids":["E1","E2"]},"q"]]})
+            .to_string(),
+        )
+        .create();
+    let _eg = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("Email/get".into()))
+        .with_body(
+            json!({"methodResponses":[["Email/get",{"accountId":"w","state":"se1","list":[
+                {"id":"E1","blobId":"BLB1","receivedAt":"2020-01-01T00:00:00Z","mailboxIds":{"MX":true},"keywords":{"$seen":true}},
+                {"id":"E2","blobId":"BLB2","receivedAt":"2020-01-02T00:00:00Z","mailboxIds":{"MX":true},"keywords":{}}
+            ],"notFound":[]},"g"]]})
+            .to_string(),
+        )
+        .create();
+    let _dl1 = server
+        .mock("GET", Matcher::Regex("/jmap/dl/w/BLB1/.*".into()))
+        .with_body("From: a@x\r\nMessage-ID: <1@h>\r\n\r\nbody-one")
+        .create();
+    let _dl2 = server
+        .mock("GET", Matcher::Regex("/jmap/dl/w/BLB2/.*".into()))
+        .with_status(404)
+        .with_body(json!({"status":404,"title":"Not Found"}).to_string())
+        .create();
+
+    let summary = sync::import_jmap::run(
+        common(&archive),
+        import_cfg_objects(&base, vec![ObjectType::Mailbox, ObjectType::Email]),
+    )
+    .expect("import does not abort on a missing blob");
+
+    let email = summary
+        .per_type
+        .iter()
+        .find(|(t, _)| *t == "Email")
+        .map(|(_, c)| c.clone())
+        .expect("email counts");
+    assert_eq!(email.fetched, 1, "only the email with a present blob imports");
+    assert_eq!(
+        email.failed, 1,
+        "a missing blob counts the email failed exactly once, not twice"
+    );
+    assert!(summary.any_failed());
+
+    let conn = rusqlite::Connection::open(&archive).unwrap();
+    assert_eq!(
+        conn.query_row::<i64, _, _>("SELECT count(*) FROM emails", [], |r| r.get(0))
+            .unwrap(),
+        1,
+        "the skipped email leaves no row"
+    );
+    assert_eq!(
+        conn.query_row::<i64, _, _>(
+            "SELECT count(*) FROM sync_id_jmap WHERE type_name='Email'",
+            [],
+            |r| r.get(0)
+        )
+        .unwrap(),
+        1,
+        "no id mapping is recorded for the skipped email, so a re-run retries it"
+    );
+    let _ = std::fs::remove_file(&archive);
+}
+
+#[test]
 fn export_missing_target_email_is_created_on_rerun() {
     let mut server = mockito::Server::new();
     let base = server.url();
