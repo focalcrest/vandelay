@@ -582,12 +582,7 @@ fn upsert_mailboxes(
             tx.execute(
                 "INSERT INTO mailboxes (name, parent_id, role, sort_order, is_subscribed)
                  VALUES (?1, ?2, ?3, 0, ?4)",
-                params![
-                    folder.leaf,
-                    parent_local,
-                    role,
-                    folder.subscribed as i64
-                ],
+                params![folder.leaf, parent_local, role, folder.subscribed as i64],
             )?;
             let new_id = tx.last_insert_rowid();
             db::imap_ids::insert_mailbox(&tx, source_id, &folder.name, new_id)?;
@@ -927,12 +922,10 @@ fn insert_single_message(
             logger,
             LEVEL_DEFAULT,
             &format!(
-                "folder {folder:?} uid {uid}: BODY[] {} bytes vs RFC822.SIZE {declared_size}, skipping",
+                "folder {folder:?} uid {uid}: BODY[] {} bytes vs RFC822.SIZE {declared_size}, importing the fetched literal",
                 body.len()
             ),
         );
-        counts.skipped += 1;
-        return Ok(());
     }
     let translation = translate_flags(&attrs.flags, include_deleted);
     if translation.has_deleted_flag && !include_deleted {

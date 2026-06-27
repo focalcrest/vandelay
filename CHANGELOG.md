@@ -2,6 +2,15 @@
 
 All notable changes to this project will be documented in this file. This project adheres to [Semantic Versioning](http://semver.org/).
 
+## [1.0.5] - 2026-06-27
+
+### Added
+
+### Changed
+
+### Fixed
+- Strict `RFC822.SIZE` == `BODY[]` length check discards good mail.
+
 ## [1.0.4] - 2026-06-21
 
 ### Added

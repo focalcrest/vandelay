@@ -707,7 +707,7 @@ fn coordinator_falls_back_to_uid_fetch_when_search_all_bad() {
 }
 
 #[test]
-fn coordinator_skips_message_on_size_mismatch() {
+fn coordinator_imports_message_despite_size_mismatch() {
     let control = control_script_one_folder(100, 2, &[1]);
     let worker: Script = Box::new(|conn: &mut MockConn| -> std::io::Result<()> {
         auth_preamble(conn, "IMAP4rev2 LITERAL+ AUTH=PLAIN")?;
@@ -734,8 +734,10 @@ fn coordinator_skips_message_on_size_mismatch() {
         .iter()
         .find(|(k, _)| *k == "email")
         .unwrap();
-    assert_eq!(email.1.skipped, 1);
-    assert_eq!(email.1.created, 0);
+    assert_eq!(email.1.skipped, 0);
+    assert_eq!(email.1.created, 1);
+    let dbc = Connection::open(&archive).unwrap();
+    assert_eq!(count(&dbc, "emails"), 1);
 }
 
 fn single_inbox_scripts(uidvalidity: u32, uidnext: u32, body: &'static [u8]) -> Vec<Script> {
