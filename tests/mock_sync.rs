@@ -317,6 +317,177 @@ fn email_export_sends_one_email_per_import_call() {
     let _ = std::fs::remove_file(&archive);
 }
 
+#[test]
+fn export_email_blob_not_found_reuploads_and_retries() {
+    let mut server = mockito::Server::new();
+    let base = server.url();
+    let api = "/jmap/api";
+
+    let archive = tmp();
+    {
+        let conn = db::init::open(&archive).unwrap();
+        conn.execute(
+            "INSERT INTO mailboxes (id,name,parent_id,role) VALUES (1,'Inbox',NULL,'inbox')",
+            [],
+        )
+        .unwrap();
+        let raw = b"From: a@x\r\nSubject: dup\r\nMessage-ID: <dup-1@h>\r\n\r\nbody";
+        let blob = db::blobs::intern_blob(&conn, raw).unwrap();
+        for _ in 0..2 {
+            conn.execute(
+                "INSERT INTO emails (blob_id,received_at,mailbox_ids,keywords)
+                 VALUES (?1,'2020-01-01T00:00:00Z','[1]','[]')",
+                rusqlite::params![blob],
+            )
+            .unwrap();
+        }
+    }
+
+    let _root = server.mock("GET", "/").with_status(404).create();
+    let _wk = server
+        .mock("GET", "/.well-known/jmap")
+        .with_body(session_body(&base))
+        .create();
+
+    let _mq1 = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("Mailbox/query".into()))
+        .with_body(
+            json!({"methodResponses":[["Mailbox/query",
+            {"accountId":"w","ids":["t1"]},"q"]]})
+            .to_string(),
+        )
+        .expect(1)
+        .create();
+    let _mq2 = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("Mailbox/query".into()))
+        .with_body(
+            json!({"methodResponses":[["Mailbox/query",
+            {"accountId":"w","ids":[]},"q"]]})
+            .to_string(),
+        )
+        .expect(1)
+        .create();
+    let _mg = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("Mailbox/get".into()))
+        .with_body(
+            json!({"methodResponses":[["Mailbox/get",{"accountId":"w","list":[
+            {"id":"t1","name":"Inbox","role":"inbox","parentId":null,
+             "myRights":{"mayDelete":true}}],"notFound":[]},"g"]]})
+            .to_string(),
+        )
+        .expect(1)
+        .create();
+    let _eq = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("Email/query".into()))
+        .with_body(
+            json!({"methodResponses":[["Email/query",
+            {"accountId":"w","ids":[]},"q"]]})
+            .to_string(),
+        )
+        .expect(1)
+        .create();
+
+    let up1 = server
+        .mock("POST", Matcher::Regex("/jmap/upload/".into()))
+        .with_body(json!({"blobId":"UP1"}).to_string())
+        .expect(1)
+        .create();
+    let up2 = server
+        .mock("POST", Matcher::Regex("/jmap/upload/".into()))
+        .with_body(json!({"blobId":"UP2"}).to_string())
+        .expect(1)
+        .create();
+
+    let imp_e1 = server
+        .mock("POST", api)
+        .match_body(Matcher::AllOf(vec![
+            Matcher::Regex("Email/import".into()),
+            Matcher::Regex("e1".into()),
+        ]))
+        .with_body(
+            json!({"methodResponses":[["Email/import",{"accountId":"w",
+                "created":{"e1":{"id":"x1","blobId":"UP1","threadId":"t","size":10}}},"i"]]})
+            .to_string(),
+        )
+        .expect(1)
+        .create();
+    let imp_e2_stale = server
+        .mock("POST", api)
+        .match_body(Matcher::AllOf(vec![
+            Matcher::Regex("Email/import".into()),
+            Matcher::Regex("e2".into()),
+            Matcher::Regex("UP1".into()),
+        ]))
+        .with_body(
+            json!({"methodResponses":[["Email/import",{"accountId":"w",
+                "notCreated":{"e2":{"type":"blobNotFound"}}},"i"]]})
+            .to_string(),
+        )
+        .expect(1)
+        .create();
+    let imp_e2_fresh = server
+        .mock("POST", api)
+        .match_body(Matcher::AllOf(vec![
+            Matcher::Regex("Email/import".into()),
+            Matcher::Regex("e2".into()),
+            Matcher::Regex("UP2".into()),
+        ]))
+        .with_body(
+            json!({"methodResponses":[["Email/import",{"accountId":"w",
+                "created":{"e2":{"id":"x2","blobId":"UP2","threadId":"t","size":10}}},"i"]]})
+            .to_string(),
+        )
+        .expect(1)
+        .create();
+
+    let summary = sync::export::run(
+        CommonConfig {
+            archive: archive.clone(),
+            threads: 1,
+            dry_run: false,
+            max_retries: 1,
+            allow_invalid_certs: false,
+            logger: Logger::from_flags(true, 0),
+        },
+        ExportConfig {
+            connect: ConnectConfig {
+                url: base.clone(),
+                auth: Auth::Basic {
+                    user: "u".into(),
+                    password: "p".into(),
+                },
+                account: AccountSelector::Id("w".into()),
+            },
+            objects: None,
+            prune: false,
+            yes: true,
+        },
+    )
+    .expect("export run");
+
+    let email = summary
+        .per_type
+        .iter()
+        .find(|(t, _)| *t == "Email")
+        .map(|(_, c)| c.clone())
+        .expect("email counts");
+    assert_eq!(email.created, 2, "both emails end up created");
+    assert_eq!(email.failed, 0, "blobNotFound self-heals, not a failure");
+    assert_eq!(email.skipped, 0);
+    assert!(!summary.any_failed());
+
+    up1.assert();
+    up2.assert();
+    imp_e1.assert();
+    imp_e2_stale.assert();
+    imp_e2_fresh.assert();
+    let _ = std::fs::remove_file(&archive);
+}
+
 fn session_body_full(base: &str) -> String {
     json!({
         "apiUrl": format!("{base}/jmap/api"),
@@ -1482,6 +1653,131 @@ fn export_sieve_scripts_identical_content_different_names_both_created() {
         "neither distinct name collapses onto the other"
     );
     assert_eq!(counts.failed, 0);
+    let _ = std::fs::remove_file(&archive);
+}
+
+#[test]
+fn export_sieve_blob_not_found_on_dedup_reuse_reuploads_and_retries() {
+    let mut server = mockito::Server::new();
+    let base = server.url();
+    let api = "/jmap/api";
+    let archive = tmp();
+    let shared = b"require [\"fileinto\"];\nfileinto \"Archive\";\n";
+    {
+        let conn = db::init::open(&archive).unwrap();
+        let blob = db::blobs::intern_blob(&conn, shared).unwrap();
+        conn.execute(
+            "INSERT INTO sieve_scripts (id,name,is_active,blob_id) VALUES (1,'dup-A',0,?1)",
+            rusqlite::params![blob],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO sieve_scripts (id,name,is_active,blob_id) VALUES (2,'dup-B',0,?1)",
+            rusqlite::params![blob],
+        )
+        .unwrap();
+    }
+
+    let _root = server.mock("GET", "/").with_status(404).create();
+    let _wk = server
+        .mock("GET", "/.well-known/jmap")
+        .with_body(session_body_full(&base))
+        .expect_at_least(1)
+        .create();
+    let _g = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("SieveScript/get".into()))
+        .with_body(
+            json!({"methodResponses":[["SieveScript/get",
+                {"accountId":"w","list":[],"notFound":[]},"g"]]})
+            .to_string(),
+        )
+        .expect(1)
+        .create();
+    let up1 = server
+        .mock("POST", Matcher::Regex("/jmap/upload/".into()))
+        .with_body(json!({"blobId":"UP1"}).to_string())
+        .expect(1)
+        .create();
+    let up2 = server
+        .mock("POST", Matcher::Regex("/jmap/upload/".into()))
+        .with_body(json!({"blobId":"UP2"}).to_string())
+        .expect(1)
+        .create();
+    let create_a = server
+        .mock("POST", api)
+        .match_body(Matcher::AllOf(vec![
+            Matcher::Regex("SieveScript/set".into()),
+            Matcher::Regex("dup-A".into()),
+        ]))
+        .with_body(
+            json!({"methodResponses":[["SieveScript/set",{"accountId":"w",
+                "created":{"c1":{"id":"S1"}}},"s"]]})
+            .to_string(),
+        )
+        .expect(1)
+        .create();
+    let create_b_stale = server
+        .mock("POST", api)
+        .match_body(Matcher::AllOf(vec![
+            Matcher::Regex("SieveScript/set".into()),
+            Matcher::Regex("dup-B".into()),
+            Matcher::Regex("UP1".into()),
+        ]))
+        .with_body(
+            json!({"methodResponses":[["SieveScript/set",{"accountId":"w",
+                "notCreated":{"c2":{"type":"blobNotFound"}}},"s"]]})
+            .to_string(),
+        )
+        .expect(1)
+        .create();
+    let create_b_fresh = server
+        .mock("POST", api)
+        .match_body(Matcher::AllOf(vec![
+            Matcher::Regex("SieveScript/set".into()),
+            Matcher::Regex("dup-B".into()),
+            Matcher::Regex("UP2".into()),
+        ]))
+        .with_body(
+            json!({"methodResponses":[["SieveScript/set",{"accountId":"w",
+                "created":{"c2":{"id":"S2"}}},"s"]]})
+            .to_string(),
+        )
+        .expect(1)
+        .create();
+    let _deactivate = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("onSuccessDeactivateScript".into()))
+        .with_body(
+            json!({"methodResponses":[["SieveScript/set",{"accountId":"w"},"a"]]}).to_string(),
+        )
+        .expect(1)
+        .create();
+
+    let summary = sync::export::run(
+        common(&archive),
+        export_cfg_objects(&base, vec![ObjectType::SieveScript]),
+    )
+    .expect("export");
+    up1.assert();
+    up2.assert();
+    create_a.assert();
+    create_b_stale.assert();
+    create_b_fresh.assert();
+    let counts = summary
+        .per_type
+        .iter()
+        .find(|(t, _)| *t == "SieveScript")
+        .map(|(_, c)| c.clone())
+        .expect("sieve counts");
+    assert_eq!(
+        counts.created, 2,
+        "the dedup-reused blobId that came back blobNotFound self-heals via re-upload"
+    );
+    assert_eq!(
+        counts.failed, 0,
+        "blobNotFound on a reused blob is not a failure"
+    );
     let _ = std::fs::remove_file(&archive);
 }
 

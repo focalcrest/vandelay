@@ -2,6 +2,15 @@
 
 All notable changes to this project will be documented in this file. This project adheres to [Semantic Versioning](http://semver.org/).
 
+## [1.0.6] - 2026-06-XX
+
+### Added
+
+### Changed
+
+### Fixed
+- Self heal on `blobNotFound` errors when exporting data (#13).
+
 ## [1.0.5] - 2026-06-27
 
 ### Added

@@ -9,7 +9,7 @@ use std::collections::{HashMap, HashSet};
 use rusqlite::params;
 use serde_json::Value;
 
-use super::common::{create_batch, jid, target_query_get};
+use super::common::{create_batch, jid, retry_if_blob_missing, target_query_get};
 use super::{Net, Plan, Uploader};
 use crate::error::Error;
 use crate::jmap::wire::JmapId;
@@ -182,6 +182,8 @@ pub fn reconcile(
                     counts.failed += 1;
                     continue;
                 }
+                let cid = format!("c{}", n.local);
+                let _ = uploader.take_touched();
                 let obj = match build_create(ctx, ty, n.local, maps, &mut uploader) {
                     Ok(o) => o,
                     Err(e) => {
@@ -194,8 +196,29 @@ pub fn reconcile(
                         continue;
                     }
                 };
-                let outcome = create_batch(net, ty, vec![(format!("c{}", n.local), obj)])
-                    .map_err(Error::from)?;
+                let touched = uploader.take_touched();
+                let outcome =
+                    create_batch(net, ty, vec![(cid.clone(), obj)]).map_err(Error::from)?;
+                let outcome = match retry_if_blob_missing(
+                    net,
+                    ty,
+                    &cid,
+                    &mut uploader,
+                    touched,
+                    outcome,
+                    |up| build_create(ctx, ty, n.local, maps, up),
+                ) {
+                    Ok(o) => o,
+                    Err(e) => {
+                        logger.warn(&format!(
+                            "{} local {} skipped: {e}",
+                            ty.jmap_name(),
+                            n.local
+                        ));
+                        counts.failed += 1;
+                        continue;
+                    }
+                };
                 for (cid, v) in &outcome.created {
                     if let Some(local) = cid.strip_prefix('c').and_then(|s| s.parse::<i64>().ok())
                         && let Some(id) = jid(v)

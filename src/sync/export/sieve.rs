@@ -8,7 +8,7 @@ use std::collections::{HashMap, HashSet};
 
 use serde_json::{Value, json};
 
-use super::common::{create_batch, jid, target_get_all};
+use super::common::{create_batch, jid, retry_if_blob_missing, target_get_all};
 use super::{Maps, Net, Plan, Uploader};
 use crate::error::Error;
 use crate::jmap::request::Request;
@@ -64,16 +64,24 @@ pub fn reconcile(
             counts.skipped += 1;
             id
         } else {
-            let blob_id = uploader
-                .upload_with(*blob_local, "application/sieve")
-                .map_err(Error::from)?;
-            let mut obj = serde_json::Map::new();
-            if let Some(n) = name {
-                obj.insert("name".to_owned(), Value::String(n.clone()));
-            }
-            obj.insert("blobId".to_owned(), Value::String(blob_id.0));
-            let outcome = create_batch(net, ty, vec![(format!("c{local}"), Value::Object(obj))])
-                .map_err(Error::from)?;
+            let cid = format!("c{local}");
+            let build = |up: &mut Uploader<'_>| -> Result<Value, Error> {
+                let blob_id = up
+                    .upload_with(*blob_local, "application/sieve")
+                    .map_err(Error::from)?;
+                let mut obj = serde_json::Map::new();
+                if let Some(n) = name {
+                    obj.insert("name".to_owned(), Value::String(n.clone()));
+                }
+                obj.insert("blobId".to_owned(), Value::String(blob_id.0));
+                Ok(Value::Object(obj))
+            };
+            let _ = uploader.take_touched();
+            let wire = build(&mut uploader)?;
+            let touched = uploader.take_touched();
+            let outcome = create_batch(net, ty, vec![(cid.clone(), wire)]).map_err(Error::from)?;
+            let outcome =
+                retry_if_blob_missing(net, ty, &cid, &mut uploader, touched, outcome, build)?;
             match outcome.created.first().and_then(|(_, v)| jid(v)) {
                 Some(id) => {
                     counts.created += 1;

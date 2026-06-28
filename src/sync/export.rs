@@ -60,6 +60,7 @@ struct Uploader<'a> {
     net: &'a Net,
     conn: &'a Connection,
     cache: HashMap<i64, JmapId>,
+    touched: Vec<i64>,
 }
 
 impl<'a> Uploader<'a> {
@@ -68,10 +69,12 @@ impl<'a> Uploader<'a> {
             net,
             conn,
             cache: HashMap::new(),
+            touched: Vec::new(),
         }
     }
 
     fn upload_with(&mut self, local_id: i64, content_type: &str) -> Result<JmapId, JmapError> {
+        self.touched.push(local_id);
         if let Some(id) = self.cache.get(&local_id) {
             return Ok(id.clone());
         }
@@ -92,6 +95,14 @@ impl<'a> Uploader<'a> {
         };
         self.cache.insert(local_id, id.clone());
         Ok(id)
+    }
+
+    fn invalidate(&mut self, local_id: i64) {
+        self.cache.remove(&local_id);
+    }
+
+    fn take_touched(&mut self) -> Vec<i64> {
+        std::mem::take(&mut self.touched)
     }
 }
 
@@ -483,6 +494,36 @@ mod common {
             },
             &net.limits,
         )
+    }
+
+    fn blob_not_found(outcome: &crate::jmap::request::SetOutcome, cid: &str) -> bool {
+        outcome.not_created.iter().any(|(c, err)| {
+            c == cid && err.get("type").and_then(Value::as_str) == Some("blobNotFound")
+        })
+    }
+
+    pub fn retry_if_blob_missing<F>(
+        net: &Net,
+        ty: ObjectType,
+        cid: &str,
+        uploader: &mut Uploader<'_>,
+        touched: Vec<i64>,
+        outcome: crate::jmap::request::SetOutcome,
+        mut rebuild: F,
+    ) -> Result<crate::jmap::request::SetOutcome, Error>
+    where
+        F: FnMut(&mut Uploader<'_>) -> Result<Value, Error>,
+    {
+        if !blob_not_found(&outcome, cid) {
+            return Ok(outcome);
+        }
+        for id in &touched {
+            uploader.invalidate(*id);
+        }
+        let _ = uploader.take_touched();
+        let wire = rebuild(uploader)?;
+        let _ = uploader.take_touched();
+        create_batch(net, ty, vec![(cid.to_owned(), wire)]).map_err(Error::from)
     }
 
     fn synthesize_dry_run_outcome(
