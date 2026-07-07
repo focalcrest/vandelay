@@ -93,6 +93,44 @@ fn depth(local: i64, by: &HashMap<i64, Option<i64>>) -> usize {
     d
 }
 
+fn already_exists_id(err: &Value) -> Option<String> {
+    if err.get("type").and_then(Value::as_str) == Some("alreadyExists") {
+        err.get("existingId")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+    } else {
+        None
+    }
+}
+
+fn find_name_collision(
+    targets: &[TargetNode],
+    parent_target: Option<&str>,
+    name: &str,
+) -> Option<String> {
+    targets
+        .iter()
+        .find(|t| t.parent.as_deref() == parent_target && fold_name(&t.name) == fold_name(name))
+        .map(|t| t.id.clone())
+}
+
+fn record_merge(
+    ty: ObjectType,
+    local: i64,
+    target_id: String,
+    reason: &str,
+    maps: &mut Maps,
+    tmatched: &mut HashSet<String>,
+    logger: &Logger,
+) {
+    logger.warn(&format!(
+        "{} local {local} merged into existing target {target_id}: {reason}",
+        ty.jmap_name()
+    ));
+    maps.insert(ty, local, JmapId(target_id.clone()));
+    tmatched.insert(target_id);
+}
+
 pub fn reconcile(
     ctx: &Context,
     net: &Net,
@@ -170,16 +208,33 @@ pub fn reconcile(
             .collect();
         if interleave {
             for n in &level {
-                if let Some(p) = n.parent
-                    && maps.target(ty, p).is_none()
-                {
-                    logger.warn(&format!(
-                        "{} local {} skipped: parent {} not created",
-                        ty.jmap_name(),
+                let parent_target = match n.parent {
+                    None => None,
+                    Some(p) => match maps.target(ty, p) {
+                        Some(t) => Some(t.0),
+                        None => {
+                            logger.warn(&format!(
+                                "{} local {} skipped: parent {} not created",
+                                ty.jmap_name(),
+                                n.local,
+                                p
+                            ));
+                            counts.failed += 1;
+                            continue;
+                        }
+                    },
+                };
+                if let Some(tid) = find_name_collision(&targets, parent_target.as_deref(), &n.name) {
+                    record_merge(
+                        ty,
                         n.local,
-                        p
-                    ));
-                    counts.failed += 1;
+                        tid,
+                        "name already present on target",
+                        maps,
+                        &mut tmatched,
+                        logger,
+                    );
+                    counts.skipped += 1;
                     continue;
                 }
                 let cid = format!("c{}", n.local);
@@ -228,6 +283,20 @@ pub fn reconcile(
                     }
                 }
                 for (cid, err) in &outcome.not_created {
+                    let local = cid.strip_prefix('c').and_then(|s| s.parse::<i64>().ok());
+                    if let (Some(local), Some(existing)) = (local, already_exists_id(err)) {
+                        record_merge(
+                            ty,
+                            local,
+                            existing,
+                            "alreadyExists: reusing existing target",
+                            maps,
+                            &mut tmatched,
+                            logger,
+                        );
+                        counts.skipped += 1;
+                        continue;
+                    }
                     logger.warn(&format!("{} {cid} not created: {err}", ty.jmap_name()));
                     counts.failed += 1;
                 }
@@ -236,16 +305,33 @@ pub fn reconcile(
         }
         let mut batch: Vec<(String, Value)> = Vec::new();
         for n in &level {
-            if let Some(p) = n.parent
-                && maps.target(ty, p).is_none()
-            {
-                logger.warn(&format!(
-                    "{} local {} skipped: parent {} not created",
-                    ty.jmap_name(),
+            let parent_target = match n.parent {
+                None => None,
+                Some(p) => match maps.target(ty, p) {
+                    Some(t) => Some(t.0),
+                    None => {
+                        logger.warn(&format!(
+                            "{} local {} skipped: parent {} not created",
+                            ty.jmap_name(),
+                            n.local,
+                            p
+                        ));
+                        counts.failed += 1;
+                        continue;
+                    }
+                },
+            };
+            if let Some(tid) = find_name_collision(&targets, parent_target.as_deref(), &n.name) {
+                record_merge(
+                    ty,
                     n.local,
-                    p
-                ));
-                counts.failed += 1;
+                    tid,
+                    "name already present on target",
+                    maps,
+                    &mut tmatched,
+                    logger,
+                );
+                counts.skipped += 1;
                 continue;
             }
             match build_create(ctx, ty, n.local, maps, &mut uploader) {
@@ -290,6 +376,20 @@ pub fn reconcile(
             }
         }
         for (cid, err) in &outcome.not_created {
+            let local = cid.strip_prefix('c').and_then(|s| s.parse::<i64>().ok());
+            if let (Some(local), Some(existing)) = (local, already_exists_id(err)) {
+                record_merge(
+                    ty,
+                    local,
+                    existing,
+                    "alreadyExists: reusing existing target",
+                    maps,
+                    &mut tmatched,
+                    logger,
+                );
+                counts.skipped += 1;
+                continue;
+            }
             logger.warn(&format!("{} {cid} not created: {err}", ty.jmap_name()));
             counts.failed += 1;
         }

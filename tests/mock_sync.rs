@@ -174,6 +174,319 @@ fn export_email_already_exists_is_matched_not_failed() {
 }
 
 #[test]
+fn export_mailbox_name_collision_merges_without_create() {
+    let mut server = mockito::Server::new();
+    let base = server.url();
+    let api = "/jmap/api";
+
+    let archive = tmp();
+    {
+        let conn = db::init::open(&archive).unwrap();
+        conn.execute(
+            "INSERT INTO mailboxes (id,name,parent_id,role) VALUES
+                 (1,'Junk Email',NULL,'junk'),
+                 (2,'Junk Mail',NULL,NULL)",
+            [],
+        )
+        .unwrap();
+        let blob = db::blobs::intern_blob(
+            &conn,
+            b"From: a@x\r\nSubject: spam\r\nMessage-ID: <m-2@h>\r\n\r\nbody",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO emails (blob_id,received_at,mailbox_ids,keywords)
+             VALUES (?1,'2020-01-01T00:00:00Z','[2]','[\"$seen\"]')",
+            rusqlite::params![blob],
+        )
+        .unwrap();
+    }
+
+    let _root = server.mock("GET", "/").with_status(404).create();
+    let _wk = server
+        .mock("GET", "/.well-known/jmap")
+        .with_body(session_body(&base))
+        .create();
+
+    let _mq1 = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("Mailbox/query".into()))
+        .with_body(
+            json!({"methodResponses":[["Mailbox/query",
+            {"accountId":"w","ids":["c"]},"q"]]})
+            .to_string(),
+        )
+        .expect(1)
+        .create();
+    let _mq2 = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("Mailbox/query".into()))
+        .with_body(
+            json!({"methodResponses":[["Mailbox/query",
+            {"accountId":"w","ids":[]},"q"]]})
+            .to_string(),
+        )
+        .expect(1)
+        .create();
+    let _mg = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("Mailbox/get".into()))
+        .with_body(
+            json!({"methodResponses":[["Mailbox/get",{"accountId":"w","list":[
+            {"id":"c","name":"Junk Mail","role":"junk","parentId":null,
+             "myRights":{"mayDelete":true}}],"notFound":[]},"g"]]})
+            .to_string(),
+        )
+        .expect(1)
+        .create();
+
+    let no_set = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("Mailbox/set".into()))
+        .expect(0)
+        .create();
+
+    let _eq = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("Email/query".into()))
+        .with_body(
+            json!({"methodResponses":[["Email/query",
+            {"accountId":"w","ids":[]},"q"]]})
+            .to_string(),
+        )
+        .expect(1)
+        .create();
+    let _up = server
+        .mock("POST", Matcher::Regex("/jmap/upload/".into()))
+        .with_body(json!({"blobId":"UPLOADED"}).to_string())
+        .expect(1)
+        .create();
+    let import_into_c = server
+        .mock("POST", api)
+        .match_body(Matcher::AllOf(vec![
+            Matcher::Regex("Email/import".into()),
+            Matcher::Regex(r#""c":true"#.into()),
+        ]))
+        .with_body(
+            json!({"methodResponses":[["Email/import",{"accountId":"w",
+                "created":{"e1":{"id":"E1","blobId":"b","threadId":"t","size":10}}},"i"]]})
+            .to_string(),
+        )
+        .expect(1)
+        .create();
+
+    let summary = sync::export::run(
+        CommonConfig {
+            archive: archive.clone(),
+            threads: 1,
+            dry_run: false,
+            max_retries: 1,
+            allow_invalid_certs: false,
+            logger: Logger::from_flags(true, 0),
+        },
+        ExportConfig {
+            connect: ConnectConfig {
+                url: base.clone(),
+                auth: Auth::Basic {
+                    user: "u".into(),
+                    password: "p".into(),
+                },
+                account: AccountSelector::Id("w".into()),
+            },
+            objects: None,
+            prune: false,
+            yes: true,
+        },
+    )
+    .expect("export run");
+
+    let mailbox = summary
+        .per_type
+        .iter()
+        .find(|(t, _)| *t == "Mailbox")
+        .map(|(_, c)| c.clone())
+        .expect("mailbox counts");
+    assert_eq!(mailbox.created, 0, "no mailbox is created");
+    assert_eq!(mailbox.failed, 0, "the name collision is not a failure");
+    assert_eq!(
+        mailbox.skipped, 2,
+        "role-matched Junk Email + merged Junk Mail"
+    );
+
+    let email = summary
+        .per_type
+        .iter()
+        .find(|(t, _)| *t == "Email")
+        .map(|(_, c)| c.clone())
+        .expect("email counts");
+    assert_eq!(email.created, 1, "the Junk Mail email lands on the target");
+    assert_eq!(email.failed, 0);
+    assert!(!summary.any_failed());
+
+    no_set.assert();
+    import_into_c.assert();
+    let _ = std::fs::remove_file(&archive);
+}
+
+#[test]
+fn export_mailbox_already_exists_maps_existing_id() {
+    let mut server = mockito::Server::new();
+    let base = server.url();
+    let api = "/jmap/api";
+
+    let archive = tmp();
+    {
+        let conn = db::init::open(&archive).unwrap();
+        conn.execute(
+            "INSERT INTO mailboxes (id,name,parent_id,role) VALUES (1,'Junk Mail',NULL,NULL)",
+            [],
+        )
+        .unwrap();
+        let blob = db::blobs::intern_blob(
+            &conn,
+            b"From: a@x\r\nSubject: spam\r\nMessage-ID: <m-3@h>\r\n\r\nbody",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO emails (blob_id,received_at,mailbox_ids,keywords)
+             VALUES (?1,'2020-01-01T00:00:00Z','[1]','[\"$seen\"]')",
+            rusqlite::params![blob],
+        )
+        .unwrap();
+    }
+
+    let _root = server.mock("GET", "/").with_status(404).create();
+    let _wk = server
+        .mock("GET", "/.well-known/jmap")
+        .with_body(session_body(&base))
+        .create();
+
+    let _mq1 = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("Mailbox/query".into()))
+        .with_body(
+            json!({"methodResponses":[["Mailbox/query",
+            {"accountId":"w","ids":["t1"]},"q"]]})
+            .to_string(),
+        )
+        .expect(1)
+        .create();
+    let _mq2 = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("Mailbox/query".into()))
+        .with_body(
+            json!({"methodResponses":[["Mailbox/query",
+            {"accountId":"w","ids":[]},"q"]]})
+            .to_string(),
+        )
+        .expect(1)
+        .create();
+    let _mg = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("Mailbox/get".into()))
+        .with_body(
+            json!({"methodResponses":[["Mailbox/get",{"accountId":"w","list":[
+            {"id":"t1","name":"Inbox","role":"inbox","parentId":null,
+             "myRights":{"mayDelete":true}}],"notFound":[]},"g"]]})
+            .to_string(),
+        )
+        .expect(1)
+        .create();
+
+    let set_collides = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("Mailbox/set".into()))
+        .with_body(
+            json!({"methodResponses":[["Mailbox/set",{"accountId":"w",
+                "notCreated":{"c1":{"type":"alreadyExists","existingId":"c"}}},"s"]]})
+            .to_string(),
+        )
+        .expect(1)
+        .create();
+
+    let _eq = server
+        .mock("POST", api)
+        .match_body(Matcher::Regex("Email/query".into()))
+        .with_body(
+            json!({"methodResponses":[["Email/query",
+            {"accountId":"w","ids":[]},"q"]]})
+            .to_string(),
+        )
+        .expect(1)
+        .create();
+    let _up = server
+        .mock("POST", Matcher::Regex("/jmap/upload/".into()))
+        .with_body(json!({"blobId":"UPLOADED"}).to_string())
+        .expect(1)
+        .create();
+    let import_into_c = server
+        .mock("POST", api)
+        .match_body(Matcher::AllOf(vec![
+            Matcher::Regex("Email/import".into()),
+            Matcher::Regex(r#""c":true"#.into()),
+        ]))
+        .with_body(
+            json!({"methodResponses":[["Email/import",{"accountId":"w",
+                "created":{"e1":{"id":"E1","blobId":"b","threadId":"t","size":10}}},"i"]]})
+            .to_string(),
+        )
+        .expect(1)
+        .create();
+
+    let summary = sync::export::run(
+        CommonConfig {
+            archive: archive.clone(),
+            threads: 1,
+            dry_run: false,
+            max_retries: 1,
+            allow_invalid_certs: false,
+            logger: Logger::from_flags(true, 0),
+        },
+        ExportConfig {
+            connect: ConnectConfig {
+                url: base.clone(),
+                auth: Auth::Basic {
+                    user: "u".into(),
+                    password: "p".into(),
+                },
+                account: AccountSelector::Id("w".into()),
+            },
+            objects: None,
+            prune: false,
+            yes: true,
+        },
+    )
+    .expect("export run");
+
+    let mailbox = summary
+        .per_type
+        .iter()
+        .find(|(t, _)| *t == "Mailbox")
+        .map(|(_, c)| c.clone())
+        .expect("mailbox counts");
+    assert_eq!(mailbox.created, 0, "the create collided");
+    assert_eq!(
+        mailbox.failed, 0,
+        "alreadyExists on Mailbox/set is not a failure"
+    );
+    assert_eq!(mailbox.skipped, 1, "existingId folds into matched");
+
+    let email = summary
+        .per_type
+        .iter()
+        .find(|(t, _)| *t == "Email")
+        .map(|(_, c)| c.clone())
+        .expect("email counts");
+    assert_eq!(email.created, 1, "the email lands in the existing folder");
+    assert_eq!(email.failed, 0);
+    assert!(!summary.any_failed());
+
+    set_collides.assert();
+    import_into_c.assert();
+    let _ = std::fs::remove_file(&archive);
+}
+
+#[test]
 fn email_export_sends_one_email_per_import_call() {
     let mut server = mockito::Server::new();
     let base = server.url();

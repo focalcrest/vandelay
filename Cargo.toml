@@ -39,7 +39,7 @@ rustls = { version = "0.23.40", default-features = false, features = ["aws-lc-rs
 rustls-platform-verifier = "0.7"
 regex  = "1.12"
 flate2 = "1.1.9"
-quick-xml = "0.40"
+quick-xml = "0.41"
 chrono = { version = "0.4", default-features = false, features = ["std"] }
 chrono-tz = { version = "0.10", default-features = false }
 
