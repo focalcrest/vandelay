@@ -356,6 +356,86 @@ fn baikal_starts_seeds_and_imports() {
     b.stop().expect("baikal stop");
 }
 
+#[test]
+#[ignore = "requires Docker"]
+fn baikal_carddav_preserves_apple_item_labels() {
+    let b = Baikal::start().expect("baikal start");
+    let account = &b.accounts[0];
+    let dav_root = b.dav_root();
+
+    let client =
+        integration::dav_client::DavSeed::new(dav_root.clone(), &account.username, &account.password);
+    let book = format!("/addressbooks/{}/ablabels/", account.username);
+    let mkbook = r#"<?xml version="1.0" encoding="utf-8"?>
+<d:mkcol xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:carddav">
+  <d:set><d:prop>
+    <d:resourcetype><d:collection/><c:addressbook/></d:resourcetype>
+    <d:displayname>AB Labels</d:displayname>
+  </d:prop></d:set>
+</d:mkcol>"#;
+    client.mkcol(&book, Some(mkbook)).expect("mkcol addressbook");
+
+    let uid = "apple-item-labels-1";
+    let vcard = format!(
+        "BEGIN:VCARD\r\n\
+         VERSION:3.0\r\n\
+         UID:{uid}\r\n\
+         FN:Apple Labels\r\n\
+         ITEM1.X-ABLABEL:Name1\r\n\
+         ITEM2.X-ABLABEL:Name2\r\n\
+         ITEM1.X-ABDATE:20171111\r\n\
+         ITEM2.X-ABDATE:20111111\r\n\
+         END:VCARD\r\n"
+    );
+    client
+        .put(
+            &format!("{book}apple.vcf"),
+            "text/vcard; charset=utf-8",
+            vcard.as_bytes(),
+        )
+        .expect("put vcard");
+
+    let archive = tmp_archive("baikal-ablabels");
+    let cfg = DavImportConfig {
+        kind: DavKindArg::Carddav,
+        url: format!("{dav_root}/addressbooks/{}/", account.username),
+        auth: DavAuth::Basic {
+            user: account.username.clone(),
+            password: account.password.clone(),
+        },
+        allow_cleartext: true,
+        dav_connections: 2,
+        multiget_batch: 25,
+        allow_source_change: false,
+    };
+    let summary = import_dav::run(common(&archive), cfg).expect("carddav import");
+    assert!(
+        !summary.any_failed(),
+        "carddav import had failures: {summary:?}"
+    );
+
+    let conn = open_archive(&archive);
+    let data: String = conn
+        .query_row(
+            "SELECT data FROM contact_cards WHERE uid = ?1",
+            [uid],
+            |r| r.get(0),
+        )
+        .expect("apple-labels contact missing from archive");
+    drop(conn);
+    eprintln!("archived JSContact:\n{data}");
+
+    for needle in ["x-abdate", "x-ablabel", "20171111", "20111111", "Name1", "Name2"] {
+        assert!(
+            data.to_lowercase().contains(&needle.to_lowercase()),
+            "Baikal CardDAV import dropped {needle:?}; stored: {data}"
+        );
+    }
+
+    cleanup(&archive);
+    b.stop().expect("baikal stop");
+}
+
 fn assert_event_collection_exact(conn: &Connection, seed: &AccountSeed) {
     let names = collection_names(conn, "calendars");
     let expected: HashSet<String> = seed

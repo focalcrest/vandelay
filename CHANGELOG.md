@@ -10,6 +10,7 @@ All notable changes to this project will be documented in this file. This projec
 
 ### Fixed
 - Self heal on `blobNotFound` errors when exporting data (#13).
+- Mapping existing special mailbox fails after `alreadyExists` response (#17).
 
 ## [1.0.5] - 2026-06-27
 

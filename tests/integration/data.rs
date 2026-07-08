@@ -116,6 +116,7 @@ const VCARD_VARIANTS: &[fn(usize) -> String] = &[
     vcard_v4_with_address,
     vcard_v4_nickname,
     vcard_v4_birthday,
+    vcard_v3_apple_item_labels,
 ];
 
 fn synth_vcards(n: usize) -> Vec<RawFixture> {
@@ -236,6 +237,22 @@ fn vcard_v4_birthday(i: usize) -> String {
          N:Contact{i};V4Birthday;;;\r\n\
          BDAY:{year:04}{month:02}{day:02}\r\n\
          EMAIL:v4-bday-{i}@vandelay.test\r\n\
+         END:VCARD\r\n"
+    )
+}
+
+fn vcard_v3_apple_item_labels(i: usize) -> String {
+    format!(
+        "BEGIN:VCARD\r\n\
+         VERSION:3.0\r\n\
+         UID:vandelay-card-ablabels-{i}\r\n\
+         FN:Apple Labels {i}\r\n\
+         N:Contact{i};AppleLabels;;;\r\n\
+         EMAIL;TYPE=INTERNET:ablabels-{i}@vandelay.test\r\n\
+         ITEM1.X-ABLABEL:Name1\r\n\
+         ITEM2.X-ABLABEL:Name2\r\n\
+         ITEM1.X-ABDATE:20171111\r\n\
+         ITEM2.X-ABDATE:20111111\r\n\
          END:VCARD\r\n"
     )
 }

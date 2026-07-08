@@ -324,6 +324,22 @@ fn component_top_level_properties(text: &str, name: &str) -> Vec<String> {
     out
 }
 
+pub fn grouped_property_values(text: &str, name: &str) -> Vec<String> {
+    let unfolded = unfold_text(text);
+    let mut out = Vec::new();
+    for line in unfolded.lines() {
+        let l = line.trim_end_matches('\r');
+        let Some(colon) = l.find(':') else { continue };
+        let head = &l[..colon];
+        let name_part = head.split(';').next().unwrap_or(head);
+        let bare = name_part.rsplit('.').next().unwrap_or(name_part);
+        if bare.eq_ignore_ascii_case(name) {
+            out.push(l[colon + 1..].to_owned());
+        }
+    }
+    out
+}
+
 pub fn has_line_prefix(text: &str, prefix: &str) -> bool {
     let unfolded = unfold_text(text);
     unfolded.lines().any(|l| l.starts_with(prefix))
@@ -538,6 +554,15 @@ pub fn assert_contact_round_trip(conn: &Connection, source: &[u8], uid: &str, la
             json_contains_string(&data, &nick),
             "{label}: contact {uid} NICKNAME {nick:?} not present"
         );
+    }
+
+    for label_name in ["X-ABLABEL", "X-ABDATE"] {
+        for value in grouped_property_values(text, label_name) {
+            assert!(
+                json_contains_string(&data, &value),
+                "{label}: contact {uid} {label_name} {value:?} not preserved in stored JSContact vCard roundtrip block"
+            );
+        }
     }
 
     if let Some(bday) = extract_property(text, "BDAY") {
