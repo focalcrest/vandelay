@@ -224,7 +224,8 @@ pub fn reconcile(
                         }
                     },
                 };
-                if let Some(tid) = find_name_collision(&targets, parent_target.as_deref(), &n.name) {
+                if let Some(tid) = find_name_collision(&targets, parent_target.as_deref(), &n.name)
+                {
                     record_merge(
                         ty,
                         n.local,

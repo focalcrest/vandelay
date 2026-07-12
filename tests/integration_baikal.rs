@@ -363,8 +363,11 @@ fn baikal_carddav_preserves_apple_item_labels() {
     let account = &b.accounts[0];
     let dav_root = b.dav_root();
 
-    let client =
-        integration::dav_client::DavSeed::new(dav_root.clone(), &account.username, &account.password);
+    let client = integration::dav_client::DavSeed::new(
+        dav_root.clone(),
+        &account.username,
+        &account.password,
+    );
     let book = format!("/addressbooks/{}/ablabels/", account.username);
     let mkbook = r#"<?xml version="1.0" encoding="utf-8"?>
 <d:mkcol xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:carddav">
@@ -373,7 +376,9 @@ fn baikal_carddav_preserves_apple_item_labels() {
     <d:displayname>AB Labels</d:displayname>
   </d:prop></d:set>
 </d:mkcol>"#;
-    client.mkcol(&book, Some(mkbook)).expect("mkcol addressbook");
+    client
+        .mkcol(&book, Some(mkbook))
+        .expect("mkcol addressbook");
 
     let uid = "apple-item-labels-1";
     let vcard = format!(
@@ -425,7 +430,14 @@ fn baikal_carddav_preserves_apple_item_labels() {
     drop(conn);
     eprintln!("archived JSContact:\n{data}");
 
-    for needle in ["x-abdate", "x-ablabel", "20171111", "20111111", "Name1", "Name2"] {
+    for needle in [
+        "x-abdate",
+        "x-ablabel",
+        "20171111",
+        "20111111",
+        "Name1",
+        "Name2",
+    ] {
         assert!(
             data.to_lowercase().contains(&needle.to_lowercase()),
             "Baikal CardDAV import dropped {needle:?}; stored: {data}"

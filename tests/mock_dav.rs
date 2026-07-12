@@ -985,6 +985,173 @@ fn webdav_discovery_keeps_only_self_row_as_root() {
 }
 
 #[test]
+fn webdav_root_collection_is_not_materialised_children_map_to_target_root() {
+    use rusqlite::Connection;
+    use vandelay::dav::discover::DiscoveredCollection;
+    use vandelay::dav::href::Href;
+    use vandelay::dav::parse::ResourceProps;
+    use vandelay::db;
+    use vandelay::db::sources::SourceKey;
+    use vandelay::logging::Logger;
+    use vandelay::sync::TypeCounts;
+    use vandelay::sync::import_dav::tree::{WebDavCtx, reconcile_filenodes};
+
+    let mut server = mockito::Server::new();
+    let url = server.url();
+
+    let root_body = format!(
+        r#"<?xml version="1.0"?>
+<d:multistatus xmlns:d="DAV:">
+  <d:response>
+    <d:href>{url}/dav/file/u/</d:href>
+    <d:propstat>
+      <d:prop><d:resourcetype><d:collection/></d:resourcetype><d:displayname>System administrator</d:displayname></d:prop>
+      <d:status>HTTP/1.1 200 OK</d:status>
+    </d:propstat>
+  </d:response>
+  <d:response>
+    <d:href>{url}/dav/file/u/sub/</d:href>
+    <d:propstat>
+      <d:prop><d:resourcetype><d:collection/></d:resourcetype><d:displayname>sub</d:displayname></d:prop>
+      <d:status>HTTP/1.1 200 OK</d:status>
+    </d:propstat>
+  </d:response>
+  <d:response>
+    <d:href>{url}/dav/file/u/top.txt</d:href>
+    <d:propstat>
+      <d:prop><d:resourcetype/><d:getcontenttype>text/plain</d:getcontenttype><d:getetag>"t1"</d:getetag></d:prop>
+      <d:status>HTTP/1.1 200 OK</d:status>
+    </d:propstat>
+  </d:response>
+</d:multistatus>"#
+    );
+    let sub_body = format!(
+        r#"<?xml version="1.0"?>
+<d:multistatus xmlns:d="DAV:">
+  <d:response>
+    <d:href>{url}/dav/file/u/sub/</d:href>
+    <d:propstat>
+      <d:prop><d:resourcetype><d:collection/></d:resourcetype><d:displayname>sub</d:displayname></d:prop>
+      <d:status>HTTP/1.1 200 OK</d:status>
+    </d:propstat>
+  </d:response>
+  <d:response>
+    <d:href>{url}/dav/file/u/sub/inner.txt</d:href>
+    <d:propstat>
+      <d:prop><d:resourcetype/><d:getcontenttype>text/plain</d:getcontenttype><d:getetag>"i1"</d:getetag></d:prop>
+      <d:status>HTTP/1.1 200 OK</d:status>
+    </d:propstat>
+  </d:response>
+</d:multistatus>"#
+    );
+    let _root = multistatus_response(&mut server, "PROPFIND", "/dav/file/u/", &root_body);
+    let _sub = multistatus_response(&mut server, "PROPFIND", "/dav/file/u/sub/", &sub_body);
+    let _f1 = server
+        .mock("GET", "/dav/file/u/top.txt")
+        .with_status(200)
+        .with_header("content-type", "text/plain")
+        .with_body("toplevel\n")
+        .create();
+    let _f2 = server
+        .mock("GET", "/dav/file/u/sub/inner.txt")
+        .with_status(200)
+        .with_header("content-type", "text/plain")
+        .with_body("inner\n")
+        .create();
+
+    let mut conn = Connection::open_in_memory().unwrap();
+    db::init::apply_schema(&conn).unwrap();
+    let source_id = db::sources::upsert_source(
+        &conn,
+        &SourceKey {
+            kind: "webdav".to_owned(),
+            session_url: url.clone(),
+            account_id: format!("{url}/dav/file/u/"),
+        },
+        Some("u"),
+        "u",
+    )
+    .unwrap();
+
+    let root = DiscoveredCollection {
+        url: format!("{url}/dav/file/u/"),
+        href: Href::from_normalised("/dav/file/u/".to_owned()),
+        props: ResourceProps {
+            is_collection: true,
+            displayname: Some("System administrator".to_owned()),
+            ..Default::default()
+        },
+    };
+    let c = client(0);
+    let ctx = WebDavCtx {
+        client: &c,
+        source_id,
+        base_url: &url,
+        dav_connections: 2,
+        logger: Logger::from_flags(false, 0),
+    };
+    let mut counts = TypeCounts::default();
+    reconcile_filenodes(&mut conn, &ctx, &root, &mut counts).expect("reconcile");
+
+    let total: i64 = conn
+        .query_row("SELECT count(*) FROM file_nodes", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(
+        total, 3,
+        "only sub/, top.txt and inner.txt land; the root collection is a virtual mount point, not a node"
+    );
+
+    let admin_named: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM file_nodes WHERE name = 'System administrator'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        admin_named, 0,
+        "the account display name must not become a directory (issue #18)"
+    );
+
+    let top_parent: Option<i64> = conn
+        .query_row(
+            "SELECT parent_id FROM file_nodes WHERE name = 'top.txt'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        top_parent, None,
+        "a file at the root maps to the target's implicit root (NULL parent)"
+    );
+
+    let (sub_id, sub_parent): (i64, Option<i64>) = conn
+        .query_row(
+            "SELECT id, parent_id FROM file_nodes WHERE name = 'sub'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        sub_parent, None,
+        "a directory at the root maps to the target's implicit root (NULL parent)"
+    );
+
+    let inner_parent: Option<i64> = conn
+        .query_row(
+            "SELECT parent_id FROM file_nodes WHERE name = 'inner.txt'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        inner_parent,
+        Some(sub_id),
+        "a nested file keeps its real parent directory"
+    );
+}
+
+#[test]
 fn streaming_propfind_strips_control_chars_before_parse() {
     let mut server = mockito::Server::new();
     let url = server.url();

@@ -26,7 +26,7 @@ use crate::sync::import_jmap::pool::Pool;
 struct FilePlan {
     item_href: String,
     parent_href: String,
-    parent_local: i64,
+    parent_local: Option<i64>,
     existing_local: Option<i64>,
     propfind_etag: String,
     propfind_content_type: Option<String>,
@@ -73,7 +73,6 @@ pub fn reconcile_filenodes(
     let dav_connections = ctx.dav_connections;
     let logger = ctx.logger;
     let absolute_root = absolute(base_url, root.href.as_str())?;
-    let root_local = super::collections::upsert_root_directory(conn, source_id, root)?;
 
     let known: Vec<(String, i64)> =
         dav_ids::collections_of_type(conn, source_id, dav_ids::FILE_NODE)
@@ -85,8 +84,8 @@ pub fn reconcile_filenodes(
 
     let mut visited: HashSet<String> = HashSet::new();
     visited.insert(root.href.as_str().to_owned());
-    let mut queue: VecDeque<(String, String, i64)> = VecDeque::new();
-    queue.push_back((absolute_root, root.href.as_str().to_owned(), root_local));
+    let mut queue: VecDeque<(String, String, Option<i64>)> = VecDeque::new();
+    queue.push_back((absolute_root, root.href.as_str().to_owned(), None));
 
     let mut file_plans: Vec<FilePlan> = Vec::new();
 
@@ -369,7 +368,7 @@ fn delete_vanished(
 struct WalkPos<'a> {
     url: &'a str,
     parent_href: &'a str,
-    parent_local: i64,
+    parent_local: Option<i64>,
 }
 
 struct WalkState<'a> {
@@ -385,7 +384,7 @@ fn walk_one(
     pos: WalkPos<'_>,
     state: WalkState<'_>,
     logger: Logger,
-) -> Result<Vec<(String, String, i64)>, Error> {
+) -> Result<Vec<(String, String, Option<i64>)>, Error> {
     let url = pos.url;
     let parent_href = pos.parent_href;
     let parent_local = pos.parent_local;
@@ -411,7 +410,7 @@ fn walk_one(
         if r.props.is_collection {
             let local = upsert_directory(conn, source_id, &r, parent_local, counts)?;
             let abs = absolute(url, r.href.as_str())?;
-            children.push((abs, r.href.as_str().to_owned(), local));
+            children.push((abs, r.href.as_str().to_owned(), Some(local)));
         } else {
             match plan_file(conn, source_id, &r, url, parent_local, parent_href) {
                 Ok(Some(plan)) => file_plans.push(plan),
@@ -439,7 +438,7 @@ fn plan_file(
     source_id: i64,
     response: &DavResponse,
     collection_url: &str,
-    parent_local: i64,
+    parent_local: Option<i64>,
     parent_href: &str,
 ) -> Result<Option<FilePlan>, Error> {
     let item_href = response.href.as_str().to_owned();
@@ -496,7 +495,7 @@ fn upsert_directory(
     conn: &mut Connection,
     source_id: i64,
     response: &DavResponse,
-    parent_local: i64,
+    parent_local: Option<i64>,
     counts: &mut TypeCounts,
 ) -> Result<i64, Error> {
     let item_href = response.href.as_str().to_owned();
@@ -625,7 +624,7 @@ mod tests {
         FilePlan {
             item_href: href.to_owned(),
             parent_href: "/dav/file/u/".to_owned(),
-            parent_local: 1,
+            parent_local: Some(1),
             existing_local: None,
             propfind_etag: String::new(),
             propfind_content_type: None,

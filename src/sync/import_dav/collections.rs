@@ -270,48 +270,6 @@ fn parse_tzid_from_vtimezone(vt: Option<&str>) -> Option<String> {
     None
 }
 
-pub fn upsert_root_directory(
-    conn: &Connection,
-    source_id: i64,
-    root: &DiscoveredCollection,
-) -> Result<i64, Error> {
-    let collection_href = root.href.as_str().to_owned();
-    let name = display_or_fallback(&root.props.displayname, &root.href);
-    if let Some(local) =
-        dav_ids::local_for_item(conn, source_id, dav_ids::FILE_NODE, &collection_href)
-            .map_err(|e| Error::Partial(e.to_string()))?
-    {
-        conn.execute(
-            "UPDATE file_nodes SET name = ?1 WHERE id = ?2",
-            params![name, local],
-        )
-        .map_err(|e| Error::Partial(e.to_string()))?;
-        return Ok(local);
-    }
-    let now = time::OffsetDateTime::now_utc()
-        .format(&time::format_description::well_known::Rfc3339)
-        .map_err(|e| Error::Partial(format!("clock: {e}")))?;
-    conn.execute(
-        "INSERT INTO file_nodes (parent_id, node_type, blob_id, target, name, media_type,
-                                  created, modified, is_subscribed, role)
-         VALUES (NULL, 'directory', NULL, NULL, ?1, NULL, ?2, NULL, 1, NULL)",
-        params![name, now],
-    )
-    .map_err(|e| Error::Partial(e.to_string()))?;
-    let local_id = conn.last_insert_rowid();
-    dav_ids::insert(
-        conn,
-        source_id,
-        dav_ids::FILE_NODE,
-        &collection_href,
-        &collection_href,
-        "",
-        local_id,
-    )
-    .map_err(|e| Error::Partial(e.to_string()))?;
-    Ok(local_id)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

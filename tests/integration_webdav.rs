@@ -89,8 +89,8 @@ fn webdav_starts_seeds_and_imports() {
                 |r| r.get(0),
             )
             .unwrap();
-        let expected_dirs = account.layout.files.iter().filter(|s| s.directory).count() + 1;
-        let expected_files = account.layout.files.len() - (expected_dirs - 1);
+        let expected_dirs = account.layout.files.iter().filter(|s| s.directory).count();
+        let expected_files = account.layout.files.len() - expected_dirs;
 
         assert_eq!(
             files as usize, expected_files,
@@ -99,15 +99,42 @@ fn webdav_starts_seeds_and_imports() {
         );
         assert_eq!(
             dirs as usize, expected_dirs,
-            "{}: directory count mismatch (seeded layout dirs + account root = {expected_dirs}, imported {dirs})",
+            "{}: directory count mismatch (seeded layout dirs = {expected_dirs}, imported {dirs}); the account root is a virtual mount point, not a node (issue #18)",
             seed.username
         );
         assert_eq!(
             nodes,
-            account.layout.files.len() + 1,
-            "{}: total file_nodes mismatch (layout + account root)",
+            account.layout.files.len(),
+            "{}: total file_nodes mismatch (layout only, no synthetic account-root node)",
             seed.username
         );
+
+        let admin_root_nodes: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM file_nodes WHERE name = ?1",
+                [&account.username],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            admin_root_nodes, 0,
+            "{}: the account root must not be materialised as a directory named after the account (issue #18)",
+            seed.username
+        );
+        for spec in account.layout.files.iter().filter(|s| s.parent.is_none()) {
+            let parent_id: Option<i64> = conn
+                .query_row(
+                    "SELECT parent_id FROM file_nodes WHERE name = ?1",
+                    [spec.name],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                parent_id, None,
+                "{}: top-level node {} must map to the target's implicit root (NULL parent), not nest under an account-root directory (issue #18)",
+                seed.username, spec.name
+            );
+        }
 
         for spec in account.layout.files {
             let segments = layout_segments(account.layout.files, spec.key);

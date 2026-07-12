@@ -2,6 +2,15 @@
 
 All notable changes to this project will be documented in this file. This project adheres to [Semantic Versioning](http://semver.org/).
 
+## [1.0.7] - 2026-07-XX
+
+### Added
+
+### Changed
+
+### Fixed
+- WebDAV import materialised the account root collection as a directory named after the account displayname (#18).
+
 ## [1.0.6] - 2026-07-12
 
 ### Added
