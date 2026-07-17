@@ -70,6 +70,9 @@ impl DavClient {
             .redirect_auth_headers(RedirectAuthHeaders::SameHost)
             .tls_config(
                 TlsConfig::builder()
+                    .unversioned_rustls_crypto_provider(std::sync::Arc::new(
+                        rustls::crypto::aws_lc_rs::default_provider(),
+                    ))
                     .root_certs(RootCerts::PlatformVerifier)
                     .disable_verification(allow_invalid_certs)
                     .build(),
