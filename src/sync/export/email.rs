@@ -114,14 +114,27 @@ pub fn reconcile(
     let local_keys = email_keys(&local_indices);
 
     let mut uploader = Uploader::new(net, &ctx.conn);
+    // Upload each blob, then accumulate the resulting import descriptors and
+    // flush them to the target in batches: a single Email/import call carries up
+    // to `maxObjectsInSet` emails, cutting per-message round-trips on bulk
+    // migrations. (Blob uploads themselves remain one-at-a-time.)
+    let chunk = net.limits.max_objects_in_set.max(1) as usize;
+    let mut batch: Vec<Pending> = Vec::with_capacity(chunk);
     for (i, key) in local_keys.iter().enumerate() {
         if target_keys.contains(key) {
             counts.skipped += 1;
             continue;
         }
         let (local_id, row) = &local[i];
-        export_one(net, &mut uploader, maps, *local_id, row, counts, logger);
+        if let Some(pending) = prepare_import(net, &mut uploader, maps, *local_id, row, counts, logger)
+        {
+            batch.push(pending);
+            if batch.len() >= chunk {
+                flush_import_batch(net, &mut uploader, maps, &mut batch, counts, logger, false);
+            }
+        }
     }
+    flush_import_batch(net, &mut uploader, maps, &mut batch, counts, logger, false);
 
     Ok(Plan::default())
 }
@@ -181,15 +194,35 @@ fn import_item(
     })
 }
 
-fn export_one(
+/// One email that has had its blob uploaded and is ready to be imported. Held
+/// in a batch so many can be created in a single Email/import request.
+struct Pending<'a> {
+    cid: String,
+    row: &'a EmailRow,
+    item: Value,
+}
+
+/// Per-creation-id outcome of an Email/import call.
+enum ImportOutcome {
+    Created,
+    Skipped,
+    BlobNotFound,
+    TooLarge,
+    Failed(String),
+}
+
+/// Upload the blob and build the import descriptor for one email. Returns
+/// `None` (having already updated `counts`/logged) when the email cannot be
+/// staged for import, or in dry-run mode where nothing is sent.
+fn prepare_import<'a>(
     net: &Net,
     uploader: &mut Uploader,
     maps: &Maps,
     local_id: i64,
-    row: &EmailRow,
+    row: &'a EmailRow,
     counts: &mut TypeCounts,
     logger: &Logger,
-) {
+) -> Option<Pending<'a>> {
     let cid = format!("e{local_id}");
     let mids = match build_mailbox_ids(row, maps) {
         Some(m) => m,
@@ -199,7 +232,7 @@ fn export_one(
                 blob_hint(uploader, row)
             ));
             counts.failed += 1;
-            return;
+            return None;
         }
     };
     let blob = match uploader.upload_with(row.blob_local_id, "message/rfc822") {
@@ -211,141 +244,197 @@ fn export_one(
                 size_note(&e)
             ));
             counts.failed += 1;
-            return;
+            return None;
         }
     };
     if net.dry_run {
         counts.created += 1;
-        return;
+        return None;
     }
     let item = import_item(blob, mids, build_keywords(row), &row.received_at);
-    match send_single_import(net, &cid, item) {
-        Ok(SingleImport::Created) => counts.created += 1,
-        Ok(SingleImport::Skipped) => counts.skipped += 1,
-        Ok(SingleImport::NotCreated { error_type, .. }) if error_type == "blobNotFound" => {
-            retry_after_reupload(net, uploader, maps, &cid, row, counts, logger);
-        }
-        Ok(SingleImport::NotCreated { detail, .. }) => {
-            logger.warn(&format!(
-                "Email/import {cid} ({}) failed: {detail}",
-                blob_hint(uploader, row)
-            ));
-            counts.failed += 1;
-        }
-        Err(e) => {
-            logger.warn(&format!(
-                "Email/import {cid} ({}) send failed: {e}{}",
-                blob_hint(uploader, row),
-                size_note(&e)
-            ));
-            counts.failed += 1;
-        }
-    }
+    Some(Pending { cid, row, item })
 }
 
-fn retry_after_reupload(
+/// Send one batch of prepared emails, tally the per-message outcomes, and, on
+/// the first pass, re-upload + re-issue any that failed with `blobNotFound`.
+/// Drains `batch`.
+fn flush_import_batch(
     net: &Net,
     uploader: &mut Uploader,
     maps: &Maps,
-    cid: &str,
-    row: &EmailRow,
+    batch: &mut Vec<Pending>,
     counts: &mut TypeCounts,
     logger: &Logger,
+    is_retry: bool,
 ) {
-    uploader.invalidate(row.blob_local_id);
-    let blob = match uploader.upload_with(row.blob_local_id, "message/rfc822") {
-        Ok(b) => b.0,
+    if batch.is_empty() {
+        return;
+    }
+    let outcomes = match send_import_batch(net, batch) {
+        Ok(o) => o,
         Err(e) => {
-            logger.warn(&format!(
-                "Email/import {cid} ({}) blob re-upload failed: {e}{}",
-                blob_hint(uploader, row),
-                size_note(&e)
-            ));
-            counts.failed += 1;
+            // A transport/method-level failure fails the whole batch; count and
+            // log each message so totals stay accurate.
+            for p in batch.iter() {
+                logger.warn(&format!(
+                    "Email/import {} ({}) send failed{}: {e}{}",
+                    p.cid,
+                    blob_hint(uploader, p.row),
+                    if is_retry { " after blob re-upload" } else { "" },
+                    size_note(&e)
+                ));
+                counts.failed += 1;
+            }
+            batch.clear();
             return;
         }
     };
-    let mids = match build_mailbox_ids(row, maps) {
-        Some(m) => m,
-        None => {
-            logger.warn(&format!(
-                "Email/import {cid} ({}) skipped: mailbox not on target",
-                blob_hint(uploader, row)
-            ));
-            counts.failed += 1;
-            return;
-        }
-    };
-    let item = import_item(blob, mids, build_keywords(row), &row.received_at);
-    match send_single_import(net, cid, item) {
-        Ok(SingleImport::Created) => counts.created += 1,
-        Ok(SingleImport::Skipped) => counts.skipped += 1,
-        Ok(SingleImport::NotCreated { detail, .. }) => {
-            logger.warn(&format!(
-                "Email/import {cid} ({}) failed after blob re-upload: {detail}",
-                blob_hint(uploader, row)
-            ));
-            counts.failed += 1;
-        }
-        Err(e) => {
-            logger.warn(&format!(
-                "Email/import {cid} ({}) send failed after blob re-upload: {e}{}",
-                blob_hint(uploader, row),
-                size_note(&e)
-            ));
-            counts.failed += 1;
+
+    let mut to_retry: Vec<Pending> = Vec::new();
+    for p in batch.drain(..) {
+        match outcomes.get(&p.cid) {
+            Some(ImportOutcome::Created) => counts.created += 1,
+            Some(ImportOutcome::Skipped) => counts.skipped += 1,
+            Some(ImportOutcome::BlobNotFound) if !is_retry => to_retry.push(p),
+            Some(ImportOutcome::BlobNotFound) => {
+                logger.warn(&format!(
+                    "Email/import {} ({}) failed after blob re-upload: blobNotFound",
+                    p.cid,
+                    blob_hint(uploader, p.row)
+                ));
+                counts.failed += 1;
+            }
+            Some(ImportOutcome::TooLarge) => {
+                logger.warn(&format!(
+                    "Email/import {} ({}) failed: exceeds the target server size limit, so this message is skipped and re-running will not migrate it",
+                    p.cid,
+                    blob_hint(uploader, p.row)
+                ));
+                counts.failed += 1;
+            }
+            Some(ImportOutcome::Failed(detail)) => {
+                logger.warn(&format!(
+                    "Email/import {} ({}) failed{}: {detail}",
+                    p.cid,
+                    blob_hint(uploader, p.row),
+                    if is_retry { " after blob re-upload" } else { "" }
+                ));
+                counts.failed += 1;
+            }
+            None => {
+                logger.warn(&format!(
+                    "Email/import {} ({}) failed: no result returned",
+                    p.cid,
+                    blob_hint(uploader, p.row)
+                ));
+                counts.failed += 1;
+            }
         }
     }
+
+    if to_retry.is_empty() {
+        return;
+    }
+
+    // Re-upload the blobs the server said it could not find, rebuild the import
+    // descriptors with the fresh blob ids, and re-issue just that subset once.
+    let mut retry_batch: Vec<Pending> = Vec::with_capacity(to_retry.len());
+    for mut p in to_retry {
+        uploader.invalidate(p.row.blob_local_id);
+        let blob = match uploader.upload_with(p.row.blob_local_id, "message/rfc822") {
+            Ok(b) => b.0,
+            Err(e) => {
+                logger.warn(&format!(
+                    "Email/import {} ({}) blob re-upload failed: {e}{}",
+                    p.cid,
+                    blob_hint(uploader, p.row),
+                    size_note(&e)
+                ));
+                counts.failed += 1;
+                continue;
+            }
+        };
+        let mids = match build_mailbox_ids(p.row, maps) {
+            Some(m) => m,
+            None => {
+                logger.warn(&format!(
+                    "Email/import {} ({}) skipped: mailbox not on target",
+                    p.cid,
+                    blob_hint(uploader, p.row)
+                ));
+                counts.failed += 1;
+                continue;
+            }
+        };
+        p.item = import_item(blob, mids, build_keywords(p.row), &p.row.received_at);
+        retry_batch.push(p);
+    }
+    flush_import_batch(net, uploader, maps, &mut retry_batch, counts, logger, true);
 }
 
-enum SingleImport {
-    Created,
-    Skipped,
-    NotCreated { error_type: String, detail: String },
-}
-
-fn send_single_import(net: &Net, cid: &str, item: Value) -> Result<SingleImport, JmapError> {
+/// Issue a single Email/import for every email in `batch`, returning the
+/// per-creation-id outcome. On `requestTooLarge` the batch is split in half and
+/// retried recursively (mirroring `set_send`); a lone email that is still too
+/// large is reported as `TooLarge` for that cid rather than aborting the run.
+/// Genuine transport/method errors propagate to the caller.
+fn send_import_batch(
+    net: &Net,
+    batch: &[Pending],
+) -> Result<HashMap<String, ImportOutcome>, JmapError> {
+    if batch.is_empty() {
+        return Ok(HashMap::new());
+    }
     let mut emails = Map::new();
-    emails.insert(cid.to_owned(), item);
+    for p in batch {
+        emails.insert(p.cid.clone(), p.item.clone());
+    }
     let mut req = Request::new();
     req.call(
         "Email/import",
         json!({ "accountId": net.account, "emails": Value::Object(emails) }),
         "i",
     );
-    req.fits(&net.limits)?;
+
+    if req.fits(&net.limits).is_err() {
+        if batch.len() <= 1 {
+            let mut out = HashMap::new();
+            out.insert(batch[0].cid.clone(), ImportOutcome::TooLarge);
+            return Ok(out);
+        }
+        let mid = batch.len() / 2;
+        let mut left = send_import_batch(net, &batch[..mid])?;
+        let right = send_import_batch(net, &batch[mid..])?;
+        left.extend(right);
+        return Ok(left);
+    }
+
     let resp = req.send(&net.client, &net.api)?;
     let mr = resp.first()?;
     check_method_error(mr)?;
-    if let Some(err) = mr
-        .args
-        .get("notCreated")
-        .and_then(Value::as_object)
-        .and_then(|nc| nc.get(cid))
-    {
-        let error_type = err
-            .get("type")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_owned();
-        if error_type == "alreadyExists" {
-            return Ok(SingleImport::Skipped);
+    let not_created = mr.args.get("notCreated").and_then(Value::as_object);
+    let created = mr.args.get("created").and_then(Value::as_object);
+
+    let mut out = HashMap::with_capacity(batch.len());
+    for p in batch {
+        if let Some(err) = not_created.and_then(|nc| nc.get(&p.cid)) {
+            let error_type = err.get("type").and_then(Value::as_str).unwrap_or("");
+            let outcome = match error_type {
+                "alreadyExists" => ImportOutcome::Skipped,
+                "blobNotFound" => ImportOutcome::BlobNotFound,
+                _ => ImportOutcome::Failed(err.to_string()),
+            };
+            out.insert(p.cid.clone(), outcome);
+        } else if created.is_some_and(|c| c.contains_key(&p.cid)) {
+            out.insert(p.cid.clone(), ImportOutcome::Created);
+        } else {
+            out.insert(
+                p.cid.clone(),
+                ImportOutcome::Failed(format!(
+                    "Email/import returned neither created nor notCreated for {}",
+                    p.cid
+                )),
+            );
         }
-        return Ok(SingleImport::NotCreated {
-            error_type,
-            detail: err.to_string(),
-        });
     }
-    if mr
-        .args
-        .get("created")
-        .and_then(Value::as_object)
-        .is_some_and(|c| !c.is_empty())
-    {
-        return Ok(SingleImport::Created);
-    }
-    Ok(SingleImport::NotCreated {
-        error_type: String::new(),
-        detail: format!("Email/import returned neither created nor notCreated for {cid}"),
-    })
+    Ok(out)
 }

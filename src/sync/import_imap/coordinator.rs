@@ -43,6 +43,11 @@ use super::pool::{FetchEvent, FetchJob, WorkerArgs, WorkerPool};
 
 const EMAIL_TYPE: &str = "email";
 
+/// Number of fetched messages to buffer in one SQLite transaction before
+/// committing. Bounds write-ahead-log growth on very large folders and makes
+/// partial import progress durable/resumable.
+const IMPORT_COMMIT_INTERVAL: usize = 256;
+
 #[derive(Clone, Copy)]
 pub(super) struct RunOpts {
     source_id: i64,
@@ -194,7 +199,14 @@ pub struct ImapImportConfig {
 
 #[derive(Debug, Clone)]
 pub enum ImapAuth {
-    Basic { user: String, password: String },
+    Basic {
+        user: String,
+        password: String,
+        /// SASL PLAIN authorization identity (authzid). When set, `user` is the
+        /// authenticating admin (authcid) and this is the target mailbox to act
+        /// as (Zimbra admin impersonation). `None` = normal, non-impersonated auth.
+        proxy_user: Option<String>,
+    },
     Bearer { user: String, token: String },
 }
 
@@ -471,19 +483,41 @@ pub(super) fn authenticate_client(client: &mut ImapClient, auth: &ImapAuth) -> R
 
 fn authenticate(client: &mut ImapClient, auth: &ImapAuth) -> Result<String, Error> {
     match auth {
-        ImapAuth::Basic { user, password } => {
+        ImapAuth::Basic {
+            user,
+            password,
+            proxy_user,
+        } => {
+            let authzid = proxy_user.as_deref();
+            // The archive is keyed on the mailbox we actually read: the proxy
+            // target when impersonating, otherwise the authenticating user.
+            let identity = proxy_user.clone().unwrap_or_else(|| user.clone());
             if client.has_capability("AUTH=PLAIN") {
-                match client.authenticate_plain(user, password) {
-                    Ok(()) => return Ok(user.clone()),
+                match client.authenticate_plain(authzid, user, password) {
+                    Ok(()) => return Ok(identity),
                     Err(e) if is_auth_failed(&e) => {
                         return Err(Error::Connection(format!("auth failed: {e}")));
                     }
-                    Err(e) if is_negotiation_failure(&e) => {}
+                    Err(e) if is_negotiation_failure(&e) => {
+                        // LOGIN cannot carry an authzid, so it cannot impersonate.
+                        // Only fall back when we are not impersonating.
+                        if authzid.is_some() {
+                            return Err(Error::Connection(format!(
+                                "AUTH=PLAIN negotiation failed and LOGIN cannot carry an \
+                                 impersonation target (--auth-proxy-user): {e}"
+                            )));
+                        }
+                    }
                     Err(e) => return Err(Error::Connection(e.to_string())),
                 }
+            } else if authzid.is_some() {
+                return Err(Error::Connection(
+                    "--auth-proxy-user requires AUTH=PLAIN, which the server does not advertise"
+                        .to_owned(),
+                ));
             }
             match client.login(user, password) {
-                Ok(()) => Ok(user.clone()),
+                Ok(()) => Ok(identity),
                 Err(e) if is_auth_failed(&e) => Err(Error::Connection(format!("auth failed: {e}"))),
                 Err(e) => Err(Error::Connection(format!("LOGIN failed: {e}"))),
             }
@@ -780,7 +814,13 @@ fn reconcile_folder(
         }
         let keepalive_interval = std::time::Duration::from_secs(45);
         let mut chunks_done: usize = 0;
-        let tx = conn.transaction()?;
+        // Commit the SQLite transaction in bounded batches rather than holding one
+        // transaction open for the whole folder: a single huge mailbox would
+        // otherwise grow the write-ahead log without limit before a lone commit.
+        // Periodic commits keep the journal bounded and make partial progress
+        // durable/resumable (already-imported UIDs are skipped on the next run).
+        let mut tx = conn.transaction()?;
+        let mut uncommitted: usize = 0;
         let target = FetchTarget {
             folder: folder.name.as_str(),
             uidvalidity,
@@ -801,6 +841,12 @@ fn reconcile_folder(
             match event {
                 FetchEvent::Item { attrs, .. } => {
                     insert_single_message(&tx, &target, &attrs, opts, counts)?;
+                    uncommitted += 1;
+                    if uncommitted >= IMPORT_COMMIT_INTERVAL {
+                        tx.commit()?;
+                        tx = conn.transaction()?;
+                        uncommitted = 0;
+                    }
                 }
                 FetchEvent::ChunkDone {
                     folder: chunk_folder,

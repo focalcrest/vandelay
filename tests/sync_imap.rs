@@ -59,6 +59,7 @@ fn imap_basic_config(localpart: &str) -> ImapImportConfig {
         auth: ImapAuth::Basic {
             user: format!("{localpart}@{}", seeder::DOMAIN),
             password: seeder::USER_PASSWORD.to_owned(),
+            proxy_user: None,
         },
         allow_cleartext: false,
         compress: false,

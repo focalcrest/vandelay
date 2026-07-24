@@ -8,7 +8,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 use std::thread;
 
-use crossbeam_channel::{Receiver, Sender, unbounded};
+use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
 
 use crate::imap::client::{ConnectMode, ImapClient};
 use crate::imap::command;
@@ -23,6 +23,11 @@ use super::coordinator::{Endpoint, ImapAuth, authenticate_client};
 use super::fetch::FetchAttrs;
 
 pub const HARD_CAP: usize = 8;
+
+/// Bounded depth of the fetch-event channel, per worker. Keeps a few bodies
+/// in flight per worker so no connection stalls, while capping total buffered
+/// bodies to a small multiple of the pool size (backpressure keeps RAM flat).
+const EVENTS_PER_WORKER: usize = 4;
 
 pub struct FetchJob {
     pub folder: String,
@@ -65,7 +70,14 @@ impl WorkerPool {
     pub fn start(args: WorkerArgs, pool_size: usize) -> Result<WorkerPool, ImapError> {
         let size = pool_size.clamp(1, HARD_CAP);
         let (job_tx, job_rx) = unbounded::<FetchJob>();
-        let (event_tx, event_rx) = unbounded::<FetchEvent>();
+        // The event channel carries full message bodies (BODY.PEEK[]). It MUST be
+        // bounded: an unbounded channel lets fetch workers race ahead of the
+        // single SQLite-writing coordinator and buffer an entire mailbox worth of
+        // bodies in RAM (we have seen real accounts >70GB), exhausting memory.
+        // Bounding it applies TCP backpressure so memory stays flat regardless of
+        // mailbox size, while still allowing enough in-flight items to keep every
+        // worker busy.
+        let (event_tx, event_rx) = bounded::<FetchEvent>(size.saturating_mul(EVENTS_PER_WORKER));
         let mut handles = Vec::with_capacity(size);
         let args = Arc::new(args);
 

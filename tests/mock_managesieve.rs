@@ -147,6 +147,7 @@ fn run_basic(
         auth: ManageSieveAuth::Basic {
             user: "alice".to_owned(),
             password: "p@ss".to_owned(),
+            proxy_user: None,
         },
         allow_cleartext: true,
         allow_source_change: false,
@@ -679,6 +680,7 @@ fn transient_no_on_getscript_retries_then_succeeds() {
         auth: ManageSieveAuth::Basic {
             user: "alice".to_owned(),
             password: "p@ss".to_owned(),
+            proxy_user: None,
         },
         allow_cleartext: true,
         allow_source_change: false,
@@ -733,6 +735,7 @@ fn bye_mid_listscripts_reconnects_and_succeeds() {
         auth: ManageSieveAuth::Basic {
             user: "alice".to_owned(),
             password: "p@ss".to_owned(),
+            proxy_user: None,
         },
         allow_cleartext: true,
         allow_source_change: false,
@@ -795,6 +798,7 @@ fn bye_mid_getscript_reconnects_and_completes_remaining_scripts() {
         auth: ManageSieveAuth::Basic {
             user: "alice".to_owned(),
             password: "p@ss".to_owned(),
+            proxy_user: None,
         },
         allow_cleartext: true,
         allow_source_change: false,
@@ -857,6 +861,7 @@ fn dry_run_does_not_mutate_archive() {
         auth: ManageSieveAuth::Basic {
             user: "alice".to_owned(),
             password: "p@ss".to_owned(),
+            proxy_user: None,
         },
         allow_cleartext: true,
         allow_source_change: false,
@@ -1016,6 +1021,7 @@ fn transient_no_exhausting_max_retries_skips_script_and_followup_picks_it_up() {
         auth: ManageSieveAuth::Basic {
             user: "alice".to_owned(),
             password: "p@ss".to_owned(),
+            proxy_user: None,
         },
         allow_cleartext: true,
         allow_source_change: false,

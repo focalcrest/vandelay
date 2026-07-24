@@ -62,6 +62,7 @@ fn basic_config(localpart: &str) -> ManageSieveImportConfig {
         auth: ManageSieveAuth::Basic {
             user: format!("{localpart}@{}", seeder::DOMAIN),
             password: seeder::USER_PASSWORD.to_owned(),
+            proxy_user: None,
         },
         allow_cleartext: false,
         allow_source_change: false,

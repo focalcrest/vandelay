@@ -26,6 +26,7 @@ fn imap_config(account: &Account, imap: &Endpoint) -> ImapImportConfig {
         auth: ImapAuth::Basic {
             user: account.username.clone(),
             password: account.password.clone(),
+            proxy_user: None,
         },
         allow_cleartext: true,
         compress: false,

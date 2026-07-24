@@ -156,6 +156,7 @@ fn run_import(
         auth: ImapAuth::Basic {
             user: user.to_owned(),
             password: "p@ss".to_owned(),
+            proxy_user: None,
         },
         allow_cleartext: true,
         compress: false,
@@ -286,7 +287,7 @@ fn authenticate_plain_with_sasl_ir() {
         Ok(())
     });
     let mut client = connect_mock(&server).expect("connect");
-    client.authenticate_plain("alice", "p@ss").expect("auth");
+    client.authenticate_plain(None, "alice", "p@ss").expect("auth");
 }
 
 #[test]
@@ -310,7 +311,7 @@ fn authenticate_plain_continuation_path() {
         Ok(())
     });
     let mut client = connect_mock(&server).expect("connect");
-    client.authenticate_plain("alice", "p@ss").expect("auth");
+    client.authenticate_plain(None, "alice", "p@ss").expect("auth");
 }
 
 #[test]
@@ -327,7 +328,7 @@ fn authenticate_plain_refused_falls_back_to_login() {
         Ok(())
     });
     let mut client = connect_mock(&server).expect("connect");
-    let err = client.authenticate_plain("alice", "p@ss").unwrap_err();
+    let err = client.authenticate_plain(None, "alice", "p@ss").unwrap_err();
     assert!(matches!(err, ImapError::AuthFailed(_)));
 }
 

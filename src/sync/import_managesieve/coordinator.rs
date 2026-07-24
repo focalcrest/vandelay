@@ -35,7 +35,14 @@ pub struct ManageSieveImportConfig {
 
 #[derive(Debug, Clone)]
 pub enum ManageSieveAuth {
-    Basic { user: String, password: String },
+    Basic {
+        user: String,
+        password: String,
+        /// SASL PLAIN authorization identity (authzid). When set, `user` is the
+        /// authenticating admin (authcid) and this is the target mailbox to act
+        /// as (Zimbra admin impersonation). `None` = normal, non-impersonated auth.
+        proxy_user: Option<String>,
+    },
     Bearer { user: String, token: String },
 }
 
@@ -415,7 +422,9 @@ fn authenticate(client: &mut SieveClient, auth: &ManageSieveAuth) -> Result<Stri
 
 fn account_id_for(auth: &ManageSieveAuth) -> String {
     match auth {
-        ManageSieveAuth::Basic { user, .. } => user.clone(),
+        ManageSieveAuth::Basic {
+            user, proxy_user, ..
+        } => proxy_user.clone().unwrap_or_else(|| user.clone()),
         ManageSieveAuth::Bearer { user, .. } => user.clone(),
     }
 }
@@ -431,17 +440,36 @@ enum SieveAuthError {
 
 fn do_authenticate(client: &mut SieveClient, auth: &ManageSieveAuth) -> Result<(), SieveAuthError> {
     match auth {
-        ManageSieveAuth::Basic { user, password } => {
+        ManageSieveAuth::Basic {
+            user,
+            password,
+            proxy_user,
+        } => {
+            let authzid = proxy_user.as_deref();
             let caps = client.capabilities().clone();
             let mut last_plain_error: Option<String> = None;
             if caps.has_sasl("PLAIN") {
-                match client.authenticate_plain(user, password) {
+                match client.authenticate_plain(authzid, user, password) {
                     Ok(()) => return Ok(()),
                     Err(e) if is_negotiation_failure(&e) => {
                         last_plain_error = Some(e.to_string());
                     }
                     Err(e) => return Err(SieveAuthError::Wire(e)),
                 }
+            }
+            // LOGIN cannot carry an authzid, so it cannot impersonate. When a
+            // proxy target is requested, do not silently fall back to LOGIN
+            // (which would authenticate as the admin's own mailbox instead).
+            if authzid.is_some() {
+                let detail = last_plain_error
+                    .map(|p| format!(": {p}"))
+                    .unwrap_or_else(|| {
+                        format!(" (server SASL list lacks PLAIN: {:?})", caps.sasl)
+                    });
+                return Err(SieveAuthError::TerminallyRefused(format!(
+                    "--auth-proxy-user requires SASL PLAIN; LOGIN cannot carry an \
+                     impersonation target{detail}"
+                )));
             }
             if caps.has_sasl("LOGIN") {
                 match client.authenticate_login(user, password) {

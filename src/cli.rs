@@ -218,6 +218,13 @@ struct ImapImportArgs {
     )]
     auth_user: Option<String>,
 
+    #[arg(
+        long,
+        value_name = "TARGET",
+        help = "SASL PLAIN authzid: authenticate as --auth-basic (admin) but act as TARGET (Zimbra impersonation)"
+    )]
+    auth_proxy_user: Option<String>,
+
     #[arg(long, help = "Permit credentials on imap:// without STARTTLS")]
     allow_cleartext: bool,
 
@@ -426,6 +433,13 @@ pub struct ManageSieveImportArgs {
     )]
     auth_user: Option<String>,
 
+    #[arg(
+        long,
+        value_name = "TARGET",
+        help = "SASL PLAIN authzid: authenticate as --auth-basic (admin) but act as TARGET (Zimbra impersonation)"
+    )]
+    auth_proxy_user: Option<String>,
+
     #[arg(long, help = "Permit credentials on sieve:// without STARTTLS")]
     allow_cleartext: bool,
 
@@ -536,6 +550,7 @@ fn resolve_managesieve_import(args: ManageSieveImportArgs) -> Result<Action, Err
         args.auth_password.as_deref(),
         args.auth_bearer.as_ref(),
         args.auth_user.as_deref(),
+        args.auth_proxy_user.as_deref(),
     )?;
     Ok(Action::ImportManageSieve(
         common,
@@ -553,6 +568,7 @@ fn resolve_managesieve_auth(
     auth_password: Option<&str>,
     auth_bearer: Option<&Option<String>>,
     auth_user: Option<&str>,
+    auth_proxy_user: Option<&str>,
 ) -> Result<ManageSieveAuth, Error> {
     if let Some(user) = auth_basic {
         if auth_user.is_some() {
@@ -564,11 +580,17 @@ fn resolve_managesieve_auth(
         return Ok(ManageSieveAuth::Basic {
             user: user.to_owned(),
             password,
+            proxy_user: auth_proxy_user.map(str::to_owned),
         });
     }
     if auth_password.is_some() {
         return Err(Error::Usage(
             "--auth-password is only valid together with --auth-basic".to_owned(),
+        ));
+    }
+    if auth_proxy_user.is_some() {
+        return Err(Error::Usage(
+            "--auth-proxy-user is only valid together with --auth-basic".to_owned(),
         ));
     }
     let bearer = auth_bearer.ok_or_else(|| {
@@ -775,6 +797,7 @@ fn resolve_imap_import(args: ImapImportArgs) -> Result<Action, Error> {
         args.auth_password.as_deref(),
         args.auth_bearer.as_ref(),
         args.auth_user.as_deref(),
+        args.auth_proxy_user.as_deref(),
     )?;
     if !args.folder.is_empty() && (!args.include.is_empty() || !args.exclude.is_empty()) {
         return Err(Error::Usage(
@@ -821,6 +844,7 @@ fn resolve_imap_auth(
     auth_password: Option<&str>,
     auth_bearer: Option<&Option<String>>,
     auth_user: Option<&str>,
+    auth_proxy_user: Option<&str>,
 ) -> Result<ImapAuth, Error> {
     if let Some(user) = auth_basic {
         if auth_user.is_some() {
@@ -832,11 +856,17 @@ fn resolve_imap_auth(
         return Ok(ImapAuth::Basic {
             user: user.to_owned(),
             password,
+            proxy_user: auth_proxy_user.map(str::to_owned),
         });
     }
     if auth_password.is_some() {
         return Err(Error::Usage(
             "--auth-password is only valid together with --auth-basic".to_owned(),
+        ));
+    }
+    if auth_proxy_user.is_some() {
+        return Err(Error::Usage(
+            "--auth-proxy-user is only valid together with --auth-basic".to_owned(),
         ));
     }
     let bearer = auth_bearer.ok_or_else(|| {

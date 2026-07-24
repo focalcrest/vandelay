@@ -191,12 +191,13 @@ impl SieveClient {
         Ok(())
     }
 
-    pub fn authenticate_plain(&mut self, authcid: &str, password: &str) -> Result<(), SieveError> {
-        let mut payload: Vec<u8> = Vec::with_capacity(authcid.len() + password.len() + 3);
-        payload.push(0);
-        payload.extend_from_slice(authcid.as_bytes());
-        payload.push(0);
-        payload.extend_from_slice(password.as_bytes());
+    pub fn authenticate_plain(
+        &mut self,
+        authzid: Option<&str>,
+        authcid: &str,
+        password: &str,
+    ) -> Result<(), SieveError> {
+        let payload = sasl_plain_payload(authzid, authcid, password);
         let encoded = BASE64.encode(&payload);
         self.send_authenticate("PLAIN", &encoded)
     }
@@ -323,6 +324,25 @@ impl SieveClient {
         let block = read_response(&mut self.reader)?;
         finish_block(block, &mut self.closed)
     }
+}
+
+/// Build a SASL PLAIN initial-response payload per RFC 4616:
+/// `authzid \0 authcid \0 password`. `None` authzid yields a bare leading NUL
+/// (empty authorization identity), byte-for-byte identical to the historical
+/// behavior; `Some` carries a proxy/impersonation target (Zimbra admin acting
+/// as another mailbox).
+fn sasl_plain_payload(authzid: Option<&str>, authcid: &str, password: &str) -> Vec<u8> {
+    let authzid_len = authzid.map_or(0, str::len);
+    let mut payload: Vec<u8> =
+        Vec::with_capacity(authzid_len + authcid.len() + password.len() + 2);
+    if let Some(authzid) = authzid {
+        payload.extend_from_slice(authzid.as_bytes());
+    }
+    payload.push(0);
+    payload.extend_from_slice(authcid.as_bytes());
+    payload.push(0);
+    payload.extend_from_slice(password.as_bytes());
+    payload
 }
 
 fn tokens_from_text(line: &[u8]) -> Result<Vec<Token>, SieveError> {
@@ -494,7 +514,37 @@ mod tests {
     fn authenticate_plain_sends_initial_response() {
         let server = b"OK\r\n";
         let mut c = client_with(server);
-        c.authenticate_plain("alice", "p@ss").unwrap();
+        c.authenticate_plain(None, "alice", "p@ss").unwrap();
+    }
+
+    #[test]
+    fn authenticate_plain_impersonation_sends_initial_response() {
+        let server = b"OK\r\n";
+        let mut c = client_with(server);
+        c.authenticate_plain(Some("target@example.com"), "admin@example.com", "pw")
+            .unwrap();
+    }
+
+    #[test]
+    fn sasl_plain_payload_without_authzid_leaves_empty_authzid() {
+        let payload = sasl_plain_payload(None, "alice", "p@ss");
+        let mut expected = vec![0u8];
+        expected.extend_from_slice(b"alice");
+        expected.push(0);
+        expected.extend_from_slice(b"p@ss");
+        assert_eq!(payload, expected);
+    }
+
+    #[test]
+    fn sasl_plain_payload_with_authzid_carries_proxy_target() {
+        let payload = sasl_plain_payload(Some("target@example.com"), "admin@example.com", "pw");
+        let mut expected = Vec::new();
+        expected.extend_from_slice(b"target@example.com");
+        expected.push(0);
+        expected.extend_from_slice(b"admin@example.com");
+        expected.push(0);
+        expected.extend_from_slice(b"pw");
+        assert_eq!(payload, expected);
     }
 
     #[test]
@@ -515,7 +565,7 @@ mod tests {
     fn authenticate_no_response_propagates_as_no() {
         let server = b"NO \"bad creds\"\r\n";
         let mut c = client_with(server);
-        let err = c.authenticate_plain("alice", "wrong").unwrap_err();
+        let err = c.authenticate_plain(None, "alice", "wrong").unwrap_err();
         assert!(matches!(err, SieveError::No(_)), "got {err:?}");
     }
 
@@ -523,7 +573,7 @@ mod tests {
     fn authenticate_referral_no_translates_to_referral() {
         let server = b"NO (REFERRAL \"sieve://other\") \"go\"\r\n";
         let mut c = client_with(server);
-        let err = c.authenticate_plain("alice", "x").unwrap_err();
+        let err = c.authenticate_plain(None, "alice", "x").unwrap_err();
         assert!(matches!(err, SieveError::Referral(_)), "got {err:?}");
     }
 }

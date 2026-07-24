@@ -28,6 +28,7 @@ fn imap_config(account: &Account, imap: &integration::Endpoint) -> ImapImportCon
         auth: ImapAuth::Basic {
             user: account.username.clone(),
             password: account.password.clone(),
+            proxy_user: None,
         },
         allow_cleartext: false,
         compress: false,
@@ -50,6 +51,7 @@ fn sieve_config(account: &Account, sieve: &integration::Endpoint) -> ManageSieve
         auth: ManageSieveAuth::Basic {
             user: account.username.clone(),
             password: account.password.clone(),
+            proxy_user: None,
         },
         allow_cleartext: true,
         allow_source_change: false,

@@ -487,7 +487,7 @@ fn export_mailbox_already_exists_maps_existing_id() {
 }
 
 #[test]
-fn email_export_sends_one_email_per_import_call() {
+fn email_export_batches_multiple_emails_per_import_call() {
     let mut server = mockito::Server::new();
     let base = server.url();
     let api = "/jmap/api";
@@ -569,25 +569,23 @@ fn email_export_sends_one_email_per_import_call() {
         .expect(2)
         .create();
 
-    let single_only = server
+    // Both emails must be created in a SINGLE Email/import call (batched export):
+    // one request carrying creation ids e1 and e2 together.
+    let batched = server
         .mock("POST", api)
         .match_body(Matcher::AllOf(vec![
             Matcher::Regex("Email/import".into()),
             Matcher::Regex("e1".into()),
             Matcher::Regex("e2".into()),
         ]))
-        .expect(0)
-        .create();
-
-    let imports = server
-        .mock("POST", api)
-        .match_body(Matcher::Regex("Email/import".into()))
         .with_body(
             json!({"methodResponses":[["Email/import",
-                {"accountId":"w","created":{"e":{"id":"x","blobId":"b","threadId":"t","size":10}}},"i"]]})
+                {"accountId":"w","created":{
+                    "e1":{"id":"x1","blobId":"b1","threadId":"t","size":10},
+                    "e2":{"id":"x2","blobId":"b2","threadId":"t","size":10}}},"i"]]})
             .to_string(),
         )
-        .expect(2)
+        .expect(1)
         .create();
 
     let summary = sync::export::run(
@@ -621,12 +619,11 @@ fn email_export_sends_one_email_per_import_call() {
         .find(|(t, _)| *t == "Email")
         .map(|(_, c)| c.clone())
         .expect("email counts");
-    assert_eq!(email.created, 2, "both emails imported in per-item rounds");
+    assert_eq!(email.created, 2, "both emails imported in one batched call");
     assert_eq!(email.failed, 0, "no per-unit failure");
     assert!(!summary.any_failed(), "no whole-run failure");
 
-    single_only.assert();
-    imports.assert();
+    batched.assert();
     let _ = std::fs::remove_file(&archive);
 }
 
@@ -715,33 +712,25 @@ fn export_email_blob_not_found_reuploads_and_retries() {
         .expect(1)
         .create();
 
-    let imp_e1 = server
+    // First (batched) import carries both e1 and e2 sharing the deduped blob
+    // UP1; the server accepts e1 but reports the blob missing for e2.
+    let imp_batch = server
         .mock("POST", api)
         .match_body(Matcher::AllOf(vec![
             Matcher::Regex("Email/import".into()),
             Matcher::Regex("e1".into()),
-        ]))
-        .with_body(
-            json!({"methodResponses":[["Email/import",{"accountId":"w",
-                "created":{"e1":{"id":"x1","blobId":"UP1","threadId":"t","size":10}}},"i"]]})
-            .to_string(),
-        )
-        .expect(1)
-        .create();
-    let imp_e2_stale = server
-        .mock("POST", api)
-        .match_body(Matcher::AllOf(vec![
-            Matcher::Regex("Email/import".into()),
             Matcher::Regex("e2".into()),
             Matcher::Regex("UP1".into()),
         ]))
         .with_body(
             json!({"methodResponses":[["Email/import",{"accountId":"w",
+                "created":{"e1":{"id":"x1","blobId":"UP1","threadId":"t","size":10}},
                 "notCreated":{"e2":{"type":"blobNotFound"}}},"i"]]})
             .to_string(),
         )
         .expect(1)
         .create();
+    // e2 alone is re-uploaded (UP2) and re-issued as a follow-up batch.
     let imp_e2_fresh = server
         .mock("POST", api)
         .match_body(Matcher::AllOf(vec![
@@ -795,8 +784,7 @@ fn export_email_blob_not_found_reuploads_and_retries() {
 
     up1.assert();
     up2.assert();
-    imp_e1.assert();
-    imp_e2_stale.assert();
+    imp_batch.assert();
     imp_e2_fresh.assert();
     let _ = std::fs::remove_file(&archive);
 }

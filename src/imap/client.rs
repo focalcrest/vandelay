@@ -195,12 +195,13 @@ impl ImapClient {
         }
     }
 
-    pub fn authenticate_plain(&mut self, authcid: &str, password: &str) -> Result<(), ImapError> {
-        let mut payload = Vec::with_capacity(authcid.len() + password.len() + 3);
-        payload.push(0);
-        payload.extend_from_slice(authcid.as_bytes());
-        payload.push(0);
-        payload.extend_from_slice(password.as_bytes());
+    pub fn authenticate_plain(
+        &mut self,
+        authzid: Option<&str>,
+        authcid: &str,
+        password: &str,
+    ) -> Result<(), ImapError> {
+        let payload = sasl_plain_payload(authzid, authcid, password);
         let encoded = BASE64.encode(&payload);
         if self.has_capability("SASL-IR") {
             let cmd = command::authenticate_with_ir("PLAIN", &encoded);
@@ -494,6 +495,26 @@ pub struct CollectedResponse {
     pub untagged: Vec<Untagged>,
 }
 
+/// Build a SASL PLAIN initial-response payload per RFC 4616:
+/// `authzid \0 authcid \0 password`. When `authzid` is `None` the authorization
+/// identity is left empty (a bare leading NUL), which the server treats as
+/// "act as the authenticating user" — byte-for-byte identical to the historical
+/// behavior. When `authzid` is `Some`, it carries a proxy/impersonation target
+/// (e.g. a Zimbra global admin authenticating as itself but acting as another
+/// mailbox).
+fn sasl_plain_payload(authzid: Option<&str>, authcid: &str, password: &str) -> Vec<u8> {
+    let authzid_len = authzid.map_or(0, str::len);
+    let mut payload = Vec::with_capacity(authzid_len + authcid.len() + password.len() + 2);
+    if let Some(authzid) = authzid {
+        payload.extend_from_slice(authzid.as_bytes());
+    }
+    payload.push(0);
+    payload.extend_from_slice(authcid.as_bytes());
+    payload.push(0);
+    payload.extend_from_slice(password.as_bytes());
+    payload
+}
+
 fn status_word(status: &Status) -> &'static str {
     match status {
         Status::Ok => "OK",
@@ -661,14 +682,47 @@ mod tests {
         let server = b"A0001 OK auth done\r\n";
         let mut c = client_with(server);
         c.capabilities.insert("SASL-IR".to_owned());
-        c.authenticate_plain("alice", "p@ss").unwrap();
+        c.authenticate_plain(None, "alice", "p@ss").unwrap();
     }
 
     #[test]
     fn authenticate_plain_continuation_path() {
         let server = b"+ \r\nA0001 OK auth done\r\n";
         let mut c = client_with(server);
-        c.authenticate_plain("alice", "p@ss").unwrap();
+        c.authenticate_plain(None, "alice", "p@ss").unwrap();
+    }
+
+    #[test]
+    fn authenticate_plain_impersonation_path() {
+        let server = b"A0001 OK auth done\r\n";
+        let mut c = client_with(server);
+        c.capabilities.insert("SASL-IR".to_owned());
+        // Admin authenticates as itself but acts as a target mailbox.
+        c.authenticate_plain(Some("target@example.com"), "admin@example.com", "adminpw")
+            .unwrap();
+    }
+
+    #[test]
+    fn sasl_plain_payload_without_authzid_leaves_empty_authzid() {
+        // Historical behavior: a bare leading NUL, then authcid \0 password.
+        let payload = sasl_plain_payload(None, "alice", "p@ss");
+        let mut expected = vec![0u8];
+        expected.extend_from_slice(b"alice");
+        expected.push(0);
+        expected.extend_from_slice(b"p@ss");
+        assert_eq!(payload, expected);
+    }
+
+    #[test]
+    fn sasl_plain_payload_with_authzid_carries_proxy_target() {
+        let payload = sasl_plain_payload(Some("target@example.com"), "admin@example.com", "pw");
+        let mut expected = Vec::new();
+        expected.extend_from_slice(b"target@example.com");
+        expected.push(0);
+        expected.extend_from_slice(b"admin@example.com");
+        expected.push(0);
+        expected.extend_from_slice(b"pw");
+        assert_eq!(payload, expected);
     }
 
     #[test]
