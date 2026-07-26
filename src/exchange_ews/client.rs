@@ -174,7 +174,9 @@ impl EwsClient {
                 format!("Basic {}", STANDARD.encode(format!("{user}:{password}")))
             }
             Some(Auth::Bearer { token }) => format!("Bearer {token}"),
-            None => String::new(),
+            // Cookie auth is a Zimbra-DAV-specific mechanism (see Auth::Cookie);
+            // EWS never constructs it, but the shared Auth enum still needs a match arm.
+            Some(Auth::Cookie { .. }) | None => String::new(),
         }
     }
 

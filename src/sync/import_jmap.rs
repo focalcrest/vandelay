@@ -143,6 +143,7 @@ fn username_of(auth: &Auth) -> String {
     match auth {
         Auth::Basic { user, .. } => user.clone(),
         Auth::Bearer { .. } => "(bearer)".to_owned(),
+        Auth::Cookie { name, .. } => format!("(cookie:{name})"),
     }
 }
 

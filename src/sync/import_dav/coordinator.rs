@@ -48,6 +48,10 @@ impl DavKindArg {
 pub enum DavAuth {
     Basic { user: String, password: String },
     Bearer { token: String },
+    /// Session-cookie auth (e.g. a Zimbra ZM_AUTH_TOKEN obtained out-of-band
+    /// via admin DelegateAuthRequest) - see Auth::Cookie for why this exists
+    /// as a separate variant from Bearer.
+    Cookie { name: String, value: String },
 }
 
 impl DavAuth {
@@ -60,6 +64,10 @@ impl DavAuth {
             DavAuth::Bearer { token } => Auth::Bearer {
                 token: token.clone(),
             },
+            DavAuth::Cookie { name, value } => Auth::Cookie {
+                name: name.clone(),
+                value: value.clone(),
+            },
         }
     }
 
@@ -67,6 +75,7 @@ impl DavAuth {
         match self {
             DavAuth::Basic { user, .. } => user.clone(),
             DavAuth::Bearer { .. } => "(bearer)".to_owned(),
+            DavAuth::Cookie { name, .. } => format!("(cookie:{name})"),
         }
     }
 }

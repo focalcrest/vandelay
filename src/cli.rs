@@ -460,7 +460,7 @@ pub struct ManageSieveImportArgs {
 }
 
 #[derive(Args)]
-#[command(group(clap::ArgGroup::new("auth").required(true).args(["auth_basic", "auth_bearer"])))]
+#[command(group(clap::ArgGroup::new("auth").required(true).args(["auth_basic", "auth_bearer", "auth_cookie"])))]
 pub struct DavImportArgs {
     #[arg(long, value_name = "URL", help = "http(s)://host[:port][/path]")]
     url: String,
@@ -482,6 +482,16 @@ pub struct DavImportArgs {
         help = "Bearer token (value optional: $VANDELAY_TOKEN or prompt)"
     )]
     auth_bearer: Option<Option<String>>,
+
+    #[arg(
+        long,
+        value_name = "NAME=VALUE",
+        help = "Raw session-cookie auth, e.g. a Zimbra ZM_AUTH_TOKEN obtained \
+                out-of-band via admin DelegateAuthRequest (some CalDAV/CardDAV \
+                servers only accept delegated/impersonated auth via cookie, \
+                not Authorization: Bearer - confirmed for Zimbra)"
+    )]
+    auth_cookie: Option<String>,
 
     #[arg(long, help = "Permit credentials on http:// (no TLS)")]
     allow_cleartext: bool,
@@ -725,6 +735,7 @@ fn resolve_dav_import(args: DavImportArgs, kind: DavKindArg) -> Result<Action, E
         args.auth_basic.as_deref(),
         args.auth_password.as_deref(),
         args.auth_bearer.as_ref(),
+        args.auth_cookie.as_deref(),
     )?;
     let dav_connections = args.dav_connections.clamp(1, 8).min(common.threads.max(1));
     let multiget_batch = args.multiget_batch.max(1);
@@ -746,7 +757,22 @@ fn resolve_dav_auth(
     auth_basic: Option<&str>,
     auth_password: Option<&str>,
     auth_bearer: Option<&Option<String>>,
+    auth_cookie: Option<&str>,
 ) -> Result<DavAuth, Error> {
+    if let Some(cookie) = auth_cookie {
+        let (name, value) = cookie.split_once('=').ok_or_else(|| {
+            Error::Usage("--auth-cookie must be in NAME=VALUE form".to_owned())
+        })?;
+        if name.is_empty() || value.is_empty() {
+            return Err(Error::Usage(
+                "--auth-cookie must be in NAME=VALUE form".to_owned(),
+            ));
+        }
+        return Ok(DavAuth::Cookie {
+            name: name.to_owned(),
+            value: value.to_owned(),
+        });
+    }
     if let Some(user) = auth_basic {
         let password = secret::resolve(auth_password, "VANDELAY_PASSWORD", "password")?;
         return Ok(DavAuth::Basic {
@@ -760,7 +786,7 @@ fn resolve_dav_auth(
         ));
     }
     let bearer = auth_bearer.ok_or_else(|| {
-        Error::Usage("exactly one of --auth-basic / --auth-bearer is required".to_owned())
+        Error::Usage("exactly one of --auth-basic / --auth-bearer / --auth-cookie is required".to_owned())
     })?;
     let token = secret::resolve(bearer.as_deref(), "VANDELAY_TOKEN", "bearer token")?;
     Ok(DavAuth::Bearer { token })

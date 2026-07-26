@@ -809,7 +809,10 @@ impl DavClient {
             .header("Accept", req.accept)
             .header("User-Agent", self.inner.user_agent.as_str());
         if req.include_auth {
-            builder = builder.header("Authorization", self.inner.auth.header_value());
+            builder = builder.header(
+                self.inner.auth.header_name(),
+                self.inner.auth.header_value(),
+            );
         }
         if let Some(d) = req.depth {
             builder = builder.header("Depth", d.to_string());

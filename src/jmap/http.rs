@@ -31,15 +31,29 @@ const LONG_RETRY_THRESHOLD: Duration = Duration::from_secs(10);
 pub enum Auth {
     Basic { user: String, password: String },
     Bearer { token: String },
+    /// Raw session-cookie auth (e.g. Zimbra's ZM_AUTH_TOKEN delegate-auth
+    /// token, which Zimbra's CalDAV/CardDAV endpoints only accept via
+    /// Cookie - not Authorization: Bearer, confirmed empirically).
+    Cookie { name: String, value: String },
 }
 
 impl Auth {
+    /// The header this auth method must be sent under - Cookie auth is not
+    /// an Authorization scheme, it needs its own header.
+    pub fn header_name(&self) -> &'static str {
+        match self {
+            Auth::Basic { .. } | Auth::Bearer { .. } => "Authorization",
+            Auth::Cookie { .. } => "Cookie",
+        }
+    }
+
     pub fn header_value(&self) -> String {
         match self {
             Auth::Basic { user, password } => {
                 format!("Basic {}", STANDARD.encode(format!("{user}:{password}")))
             }
             Auth::Bearer { token } => format!("Bearer {token}"),
+            Auth::Cookie { name, value } => format!("{name}={value}"),
         }
     }
 }
@@ -374,6 +388,7 @@ impl HttpClient {
         body: Option<&[u8]>,
         content_type: Option<&str>,
     ) -> Attempt {
+        let auth_header = self.inner.auth.header_name();
         let auth = self.inner.auth.header_value();
         let logger = self.logger();
         let started = Instant::now();
@@ -382,7 +397,7 @@ impl HttpClient {
                 .inner
                 .agent
                 .post(url)
-                .header("Authorization", auth)
+                .header(auth_header, auth)
                 .header("Accept", "application/json");
             if let Some(ct) = content_type {
                 req = req.header("Content-Type", ct);
@@ -392,7 +407,7 @@ impl HttpClient {
             self.inner
                 .agent
                 .get(url)
-                .header("Authorization", auth)
+                .header(auth_header, auth)
                 .header("Accept", "application/json")
                 .call()
         };
