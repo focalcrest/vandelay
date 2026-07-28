@@ -134,7 +134,18 @@ pub fn classify(err: &ImapError) -> Disposition {
                 Disposition::Permanent
             }
         }
-        ImapError::Protocol(_) => Disposition::Permanent,
+        // A tag mismatch (client.rs's "expected tag X, got Y") means the reader's
+        // position in the response stream is no longer aligned with the server's
+        // response boundaries - every later command on this same connection will
+        // misread whatever comes next. The connection itself is poisoned, not just
+        // this one command, so it must force a reconnect (TransportDrop) rather than
+        // being treated as a permanent, connection-reusable failure - otherwise one
+        // desync cascades into every subsequent folder/command on the same client
+        // (observed on accounts with many folders, where a control-connection UID
+        // FETCH mid-run triggers this). Parse errors are narrower (e.g. one malformed
+        // FETCH item) and stay Permanent/PerMessageRecoverable, matching existing
+        // per-message-recovery semantics below.
+        ImapError::Protocol(_) => Disposition::TransportDrop,
         ImapError::Parse(_) => Disposition::Permanent,
         ImapError::Unsupported(_) => Disposition::Permanent,
     }
@@ -221,11 +232,17 @@ mod tests {
     }
 
     #[test]
-    fn protocol_and_parse_are_permanent() {
+    fn protocol_is_transport_drop() {
+        // A tag mismatch desyncs the whole connection's read position, so it must
+        // force a reconnect rather than being reused as if only this command failed.
         assert_eq!(
             classify(&ImapError::Protocol("x".into())),
-            Disposition::Permanent
+            Disposition::TransportDrop
         );
+    }
+
+    #[test]
+    fn parse_is_permanent() {
         assert_eq!(
             classify(&ImapError::Parse("x".into())),
             Disposition::Permanent
